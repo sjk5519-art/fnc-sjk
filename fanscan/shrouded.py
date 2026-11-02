@@ -17,11 +17,16 @@ Pipeline (SPEC2, Module D)
    D2 = 300 mm (ratios are still measured).  With two known lengths (or a
    pinhole ``focal_px`` from EXIF) the camera distance is solved and the
    backplate-plane / eye-plane scales are perspective-corrected.
-3. Eye region: polar unwrap around the axis; hub flange and bore from the
-   radial profiles (circular-edge strength + angular variance).
-4. Blade count: harmonic-sum FFT of the angular *deviation* profiles
-   (|CLAHE image - per-radius median|, so bright and dark blade wedges count
-   alike), SNR-weighted vote over radii.
+3. Eye region: the through-bore (largest dark connected component near the middle of the
+   eye, hull fitted with an ellipse) anchors the impeller axis and gives the bore diameter;
+   the axis is refined along the tilt direction (backplate-vs-flange parallax) within 5 % of
+   the rim radius only.  Without a bore the rim centre / the Z-fold line search is used and a
+   search that ends at its boundary marks the axis as uncertain.  Hub flange and bore from
+   the radial profiles (circular-edge strength + angular variance).
+4. Blade count: harmonic-sum FFT of the angular *deviation* profiles of the RAW polar image
+   (no CLAHE: its 8x8 tile grid is centred on the axis and fakes a 4-fold pattern in a
+   featureless eye), SNR-weighted vote over radii; the count needs a minimum raw grey-level
+   amplitude.  The radial extent of the blade band is measured on the CLAHE image at that Z.
 5. Blade root tracing: a blade seen through the eye is a *wedge* bounded by its
    root crease and its (perspective-displaced) top edge; the root crease is the
    boundary on the +theta side, i.e. the edge where, going +phi (image frame),
@@ -30,10 +35,13 @@ Pipeline (SPEC2, Module D)
    and outer radius of the visible band, blade phase) - a 3-parameter matched
    filter that is immune to clutter, edge breaks and the straight leading-edge
    line.  Each blade is then traced along the template and refitted with the
-   integrated camber model; the per-blade phase residuals give a first-order
-   correction of the axis centre (the ellipse centres are perspective-shifted),
-   after which the tracing is repeated.  -> beta1 'measured', beta2
-   'extrapolated' with confidence ~ visible fraction of the blade span.
+   integrated camber model; traces that hug the inlet ring or the hub flange are dropped.
+   Handedness comes from the sign of d(phi)/dr of the strong band edges (stable under
+   rotation / scale / gamma, flips under a mirror) cross-checked with the template contrast;
+   when neither is decisive it is 'undetermined' (prior flag).  beta1 is 'measured' only with
+   n_good >= max(2, Z//3) agreeing, well-fitting blades, a located axis and a known hand,
+   otherwise it is a prior (conf <= 0.15) with a warning; beta2 'extrapolated' with
+   confidence ~ visible fraction of the blade span.
 6. Wrap-angle beta2 from ``rim_images`` ('side' views of the rim gap with a
    marker on the shroud rim): gap band from the vertical-edge energy, trailing
    edges = vertical edges where the depth proxy (height of the backplate band
@@ -41,10 +49,12 @@ Pipeline (SPEC2, Module D)
    the rim top edge.  The marker's fractional blade index is interpolated from
    the TE positions (polynomial in the index), which needs no camera model.
    wrap mod pitch = (TE phase - LE phase) -> ``geometry.wrap_mod_pitch_candidates``
-   -> ``geometry.beta2_from_wrap`` -> beta2 'wrap'.
+   -> ``geometry.beta2_from_wrap`` -> beta2 'wrap' (only with a perspective-corrected backplate
+   scale, i.e. two known lengths or a focal length; otherwise it is reported in debug + a
+   warning and the extrapolated beta2 is kept).
 7. Blade widths: user > rim image (gap height / TE spacing) > prior 0.2 D2;
    b1 = user > b2 + cone prior.
-8. Assembly with validation / clamping, provenance for every field.
+8. Assembly with validation / clamping; provenance is re-synchronised with every clamped value.
 
 Conventions: image frame y down; ``theta_math = -phi_img`` (see analyze.py);
 blades sweep toward +theta_math as r grows.  In a side photo taken with the
@@ -66,6 +76,7 @@ from scipy.optimize import least_squares
 from scipy.signal import find_peaks
 
 from . import geometry, pose
+from .analyze import _to_gray as _analyze_to_gray
 from .params import ImpellerParams
 from .pose import EllipseFit
 
@@ -76,6 +87,13 @@ SOURCES = ("measured", "extrapolated", "wrap", "prior", "user")
 Z_MIN, Z_MAX = 4, 48
 _COL_SCALE_FLOOR = 0.5      # per-column response scale floor as a fraction of the global scale
 _EYE_MASK_SHRINK = 0.975    # eye-region mask radius as a fraction of the eye ellipse
+_RIM_MIN_W, _RIM_MIN_H = 100, 60    # smallest usable side (rim-gap) image
+_HAND_MF_MARGIN = 1.3       # matched-filter contrast ratio needed to call the blade hand
+_HAND_OR_MIN = 0.4          # |orientation score| needed to call the blade hand from edge directions
+_AXIS_SEARCH_FRAC = 0.05    # axis refinement radius around the bore centre (fraction of the rim a)
+_BORE_SNAP_FRAC = 0.006     # bore centre this close to the rim centre (fraction of a) -> use the rim centre
+_AXIS_MOVE_GAIN = 1.02      # template contrast gain needed to leave the bore centre
+_Z_MIN_AMP = 2.0            # grey levels: minimum raw amplitude of the Z-fold pattern in the band
 
 # Priors (ratios of a typical production-type shrouded impeller, cf. SHROUDED_PARAMS_FACTORY).
 PRIOR: dict[str, float] = {
@@ -140,13 +158,17 @@ class ShroudedResult:
 # ---------------------------------------------------------------------------
 # small helpers
 # ---------------------------------------------------------------------------
-def _to_gray(img: np.ndarray) -> np.ndarray:
-    img = np.asarray(img)
-    if img.ndim == 3:
-        img = cv2.cvtColor(img, cv2.COLOR_BGRA2GRAY if img.shape[2] == 4 else cv2.COLOR_BGR2GRAY)
-    if img.dtype != np.uint8:
-        img = np.clip(img, 0, 255).astype(np.uint8)
-    return img
+def _to_gray(img: Any) -> np.ndarray:
+    """Any image -> uint8 gray, rescaling by dtype (float [0, 1], uint16) exactly like the v0.1
+    analyzer; raises ValueError for None / object / non-image arrays."""
+    if img is None:
+        raise ValueError("image is None (unreadable file?)")
+    arr = np.asarray(img)
+    if arr.dtype == object or arr.ndim not in (2, 3) or arr.size == 0 \
+            or (arr.ndim == 3 and arr.shape[2] not in (1, 3, 4)):
+        raise ValueError("image must be a non-empty uint8 HxW or HxWx3 array "
+                         f"(got dtype {arr.dtype}, shape {arr.shape})")
+    return _analyze_to_gray(arr)
 
 
 def _clahe(gray: np.ndarray, clip: float = 2.0, tiles: int = 8) -> np.ndarray:
@@ -332,6 +354,116 @@ def _ring_wall_shrink(rect: np.ndarray, eye_r: EllipseFit, debug: dict[str, Any]
     return float(np.clip(1.0 + (wall_in - 0.01 * a) / a, 0.9, default))
 
 
+def _ellipse_rho(e: EllipseFit, pts: np.ndarray) -> np.ndarray:
+    """Normalised elliptical radius of (n, 2) points w.r.t. ellipse *e* (1 = on the ellipse)."""
+    c, s_ = math.cos(math.radians(e.angle_deg)), math.sin(math.radians(e.angle_deg))
+    dx, dy = pts[:, 0] - e.center[0], pts[:, 1] - e.center[1]
+    return np.hypot((c * dx + s_ * dy) / e.a, (-s_ * dx + c * dy) / e.b)
+
+
+def _find_bore(rect: np.ndarray, eye_r: EllipseFit, c_rim: tuple[float, float],
+               debug: dict[str, Any]) -> dict[str, Any] | None:
+    """The hub bore: the largest dark connected component near the middle of the eye region.
+
+    The through-bore is the one feature of the eye that is both compact, round (the rim
+    rectification turns the flange plane into a near circle) and darker than everything around
+    it, whatever the blades, pencil marks or cables do - so it anchors the impeller axis far
+    better than the perspective-shifted rim / inlet-ring ellipse centres.  The hull of the dark
+    component (cables and a lit object seen through the hole do not matter) is fitted with an
+    ellipse -> centre + bore radius.  Returns None when no such blob passes the plausibility
+    checks (solid hub, bore not dark, clutter): the caller then keeps the old behaviour."""
+    a_eye = math.sqrt(eye_r.a * eye_r.b)
+    H, W = rect.shape[:2]
+    yy, xx = np.mgrid[0:H, 0:W]
+    rr_c = np.hypot(xx - c_rim[0], yy - c_rim[1])
+    in_eye = _ellipse_mask(eye_r, rect.shape, 0.9)
+    disc = (rr_c < 0.6 * a_eye) & in_eye
+    info: dict[str, Any] = {"found": False}
+    debug["bore_search"] = info
+    if disc.sum() < 500:
+        info["reason"] = "search disc too small"
+        return None
+    sm = cv2.GaussianBlur(rect, (0, 0), max(1.0, 0.008 * a_eye))
+    v = sm[disc]
+    p2, med = float(np.percentile(v, 2)), float(np.median(v))
+    if med - p2 < 40.0:
+        info["reason"] = f"no dark region (median {med:.0f}, 2nd percentile {p2:.0f})"
+        return None
+    t, _ = cv2.threshold(v.reshape(-1, 1).astype(np.uint8), 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    thr = min(float(t), med)
+    dark = ((sm <= thr) & disc).astype(np.uint8)
+    dark = cv2.morphologyEx(dark, cv2.MORPH_OPEN, np.ones((3, 3), np.uint8))
+    n, lab, st, cen = cv2.connectedComponentsWithStats(dark, 8)
+    order = sorted(range(1, n), key=lambda k: -st[k, cv2.CC_STAT_AREA])[:3]
+    for k in order:
+        area = float(st[k, cv2.CC_STAT_AREA])
+        if area < 0.01 * math.pi * a_eye ** 2:
+            break
+        comp = lab == k
+        cnts = cv2.findContours(comp.astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)[0]
+        pts = max(cnts, key=len)
+        if len(pts) < 20:
+            continue
+        hull = cv2.convexHull(pts)
+        (bx, by), (bw, bh), bang = cv2.fitEllipse(hull)
+        ra, rb = max(bw, bh) / 2.0, min(bw, bh) / 2.0
+        r_mean = 0.5 * (ra + rb)
+        fill = area / (math.pi * ra * rb)
+        d_far = float(rr_c[comp].max())
+        if not (0.05 * a_eye <= r_mean <= 0.5 * a_eye) or rb / ra < 0.7 or fill < 0.35 \
+                or d_far > 0.58 * a_eye or math.hypot(bx - c_rim[0], by - c_rim[1]) > 0.4 * a_eye:
+            info["reject"] = {"r": r_mean, "aspect": rb / ra, "fill": fill}
+            continue
+        e = EllipseFit.from_cv(((bx, by), (bw, bh), bang))
+        ring = np.zeros(rect.shape, np.uint8)
+        cv2.ellipse(ring, (int(round(bx)), int(round(by))), (int(1.45 * ra), int(1.45 * rb)),
+                    e.angle_deg, 0, 360, 255, -1)
+        cv2.ellipse(ring, (int(round(bx)), int(round(by))), (int(1.15 * ra), int(1.15 * rb)),
+                    e.angle_deg, 0, 360, 0, -1)
+        ring = (ring > 0) & in_eye
+        if ring.sum() < 200:
+            continue
+        contrast = float(np.mean(sm[ring]) - np.mean(sm[comp]))
+        if contrast < 40.0:
+            info["reject"] = {"contrast": contrast}
+            continue
+        info.update({"found": True, "thr": thr, "contrast": contrast, "fill": fill})
+        return {"centre": (float(bx), float(by)), "axes": (float(ra), float(rb)),
+                "angle_deg": e.angle_deg, "r_px": float(r_mean), "contrast": contrast,
+                "fill": fill, "thr": thr}
+    info.setdefault("reason", "no compact dark blob")
+    return None
+
+
+def _hand_from_orientation(img: np.ndarray, centre: tuple[float, float], mask: np.ndarray,
+                           c_lo: float, c_hi: float, n_angle: int = 1440, sigma: float = 1.5
+                           ) -> tuple[float, float]:
+    """Sweep direction from the orientation of the strong edges in the blade band.
+
+    In the polar unwrap (rows = image angle phi, y down; cols = radius) a blade crease is a line
+    along which phi changes with r.  Edge pixels whose line is neither radial (LE lines, ribs)
+    nor circular (flange / ring edges) vote with their gradient energy for the sign of
+    d(phi)/dr: phi growing with r = clockwise on the screen (hand -1), shrinking = CCW (+1).
+    Returns (score, energy) with score in [-1, 1]: > 0 clockwise (hand -1).  It needs no
+    template fit and only depends on the axis to first order, so it is stable under rotation,
+    scale and gamma, and flips under a mirror."""
+    R = int(c_hi) + 3
+    pol = _polar(img, centre, R, n_angle)
+    mp = _polar(mask.astype(np.uint8) * 255, centre, R, n_angle) > 127
+    p = gaussian_filter(pol, (sigma, sigma), mode=("wrap", "nearest"))
+    gx = 0.5 * (np.roll(p, -1, 1) - np.roll(p, 1, 1))
+    gy = 0.5 * (np.roll(p, -1, 0) - np.roll(p, 1, 0))
+    r = np.arange(R, dtype=np.float32)[None, :]
+    with np.errstate(divide="ignore", invalid="ignore"):
+        t = r * (2.0 * math.pi / n_angle) * (-gx / gy)       # tangential px per radial px of the line
+    w = gx ** 2 + gy ** 2
+    sel = mp & np.isfinite(t) & (np.abs(t) > 0.2) & (np.abs(t) < 4.0) & (r >= c_lo) & (r <= c_hi)
+    pos = float(w[sel & (t > 0)].sum())
+    neg = float(w[sel & (t < 0)].sum())
+    tot = pos + neg
+    return ((pos - neg) / tot if tot > 0 else 0.0), tot
+
+
 # ---------------------------------------------------------------------------
 # 3. eye region: hub + bore
 # ---------------------------------------------------------------------------
@@ -403,9 +535,10 @@ def _hub_bore(pol: np.ndarray, mask: np.ndarray, r_eye_px: float, blade_start: i
             above = np.where(seg > level)[0]
             if len(above):
                 r_step = _edge_cross(m, a0 + int(above.max()), level, +1)
-                # the blade band itself darkens the mean profile: accept only a step clearly
-                # inside the band start
-                if r_step <= 0.9 * blade_start:
+                # the blade band itself darkens the mean profile, so the step must lie inside
+                # the band start; the band start is only known to ~10 px (it moves ~3 % under a
+                # 20 % gamma change), hence a 4 % margin rather than a razor-edge 10 % one
+                if r_step <= 0.96 * blade_start and (r_bore is None or r_step >= 1.2 * r_bore):
                     r_hub, conf = r_step, 0.35
                     debug["hub_from"] = "intensity step"
     return r_hub, conf, r_bore
@@ -486,7 +619,7 @@ def _column_spectrum(row: np.ndarray, m: np.ndarray, kmax: int, return_white: bo
 
 
 def _blade_band_and_count(pol: np.ndarray, mask: np.ndarray, r_eye_px: float, r_min_px: float,
-                          hint: int | None, debug: dict[str, Any]
+                          hint: int | None, debug: dict[str, Any], force_Z: int | None = None
                           ) -> tuple[int | None, float, float, int | None, int | None]:
     """Blade count and blade band from the Z-periodicity of the angular profiles.
 
@@ -523,17 +656,25 @@ def _blade_band_and_count(pol: np.ndarray, mask: np.ndarray, r_eye_px: float, r_
     debug["blade_count_votes"] = {int(k): round(v, 1) for k, v in votes.items()}
     debug["column_harmonic"] = ks
     debug["column_snr"] = snr
-    if not votes:
-        return None, 0.0, 0.0, None, None
-    # merge k and 2k votes (wedge edge pairs) in favour of the fundamental
-    merged = dict(votes)
-    for k, v in votes.items():
-        if k % 2 == 0 and (k // 2) in votes and k // 2 >= Z_MIN:
-            merged[k // 2] = merged.get(k // 2, 0.0) + 0.5 * v
-    tot = sum(votes.values())
-    best = max(merged.values())
-    tied = sorted(k for k, v in merged.items() if v >= 0.9 * best)
-    Z = hint if (hint is not None and hint in tied) else max(tied, key=lambda k: merged[k])
+    if force_Z is not None:
+        # band only: the count was decided elsewhere (on the rotation-invariant image)
+        Z = int(force_Z)
+        merged, tot = {Z: 1.0}, 1.0
+        if Z not in range(Z_MIN, kmax + 1):
+            return None, 0.0, 0.0, None, None
+    else:
+        if not votes:
+            debug["blade_band_amp"] = 0.0
+            return None, 0.0, 0.0, None, None
+        # merge k and 2k votes (wedge edge pairs) in favour of the fundamental
+        merged = dict(votes)
+        for k, v in votes.items():
+            if k % 2 == 0 and (k // 2) in votes and k // 2 >= Z_MIN:
+                merged[k // 2] = merged.get(k // 2, 0.0) + 0.5 * v
+        tot = sum(votes.values())
+        best = max(merged.values())
+        tied = sorted(k for k, v in merged.items() if v >= 0.9 * best)
+        Z = hint if (hint is not None and hint in tied) else max(tied, key=lambda k: merged[k])
     # band: specific-Z test per column (single bin -> a lower threshold than the argmax vote)
     ok = np.zeros(R, bool)
     snr_z = np.zeros(R)
@@ -555,9 +696,22 @@ def _blade_band_and_count(pol: np.ndarray, mask: np.ndarray, r_eye_px: float, r_
             merged_runs.append([a, b])
     runs = [(a, b) for a, b in merged_runs if b - a >= 0.05 * r_eye_px]
     if not runs:
+        debug["blade_band_amp"] = 0.0
         return int(Z), float(merged[Z] / max(tot, 1e-9)), float(np.median(snr[cols])), None, None
     a, b = max(runs, key=lambda ab: ab[1])          # outermost run (blades reach the lip)
     band_snr = float(np.median(snr_z[a:b + 1]))
+    # raw grey-level amplitude of the Z / 2Z harmonic in the band: a whitened-spectrum SNR alone
+    # also fires on pure noise or a smooth gradient, the amplitude says whether there is a
+    # real pattern
+    amps = []
+    for c in range(a, b + 1):
+        m = mask[:, c]
+        if m.mean() < 0.15:
+            continue
+        row = np.where(m, pol[:, c], float(np.mean(pol[m, c])))
+        F = np.abs(np.fft.rfft(row - row.mean())) * 2.0 / len(row)
+        amps.append(max(float(F[Z]), float(F[2 * Z]) if 2 * Z < len(F) else 0.0))
+    debug["blade_band_amp"] = float(np.median(amps)) if amps else 0.0
     agree = float(sum(ok[a:b + 1]) / max(1, b - a + 1))
     return int(Z), agree, band_snr, int(a), int(b)
 
@@ -734,7 +888,8 @@ def _coarse_betas(step: float) -> np.ndarray:
 def _blade_analysis(rect_eq: np.ndarray, centre: tuple[float, float], eye_mask_rect: np.ndarray,
                     r_lo_px: float, r_hi_px: float, Z: int, s_bp: float, *,
                     response: str = "entry", coarse_only: bool = False, hand: int = 0,
-                    debug: dict[str, Any] | None = None) -> dict[str, Any]:
+                    debug: dict[str, Any] | None = None, eye: EllipseFit | None = None,
+                    eye_shrink: float = 1.0, hub_px: float | None = None) -> dict[str, Any]:
     """Matched-filter + per-blade tracing of the root creases around *centre*.
 
     hand : +1 blade sweeps toward +theta_math (CCW seen from the inlet, the v0.1 convention),
@@ -745,6 +900,9 @@ def _blade_analysis(rect_eq: np.ndarray, centre: tuple[float, float], eye_mask_r
                views: the parallax puts the wedge on either side, but only the root creases
                fold coherently about the backplate axis, so the matched filter still picks them).
     coarse_only : stop after the coarse matched filter (used by the centre search).
+    eye, eye_shrink, hub_px : traces that spend most of their length on the inlet-ring edge
+               (normalised eye radius > 0.9 * eye_shrink) or on the hub flange (radius < 1.05 *
+               hub_px) are flange / ring features, not blades: they are dropped (``rejected``).
 
     Returns a dict with per-blade fits, the aggregate (beta_a, beta_b) on [r_a, r_b] (mm), the
     phase of the blade pattern, the per-blade phase residuals and the support range."""
@@ -787,8 +945,8 @@ def _blade_analysis(rect_eq: np.ndarray, centre: tuple[float, float], eye_mask_r
             results[hd] = {"score": score, "contrast": contrast, "beta_a0": ba, "beta_b0": bb,
                            "centre": centre, "hand": hd}
         if len(hands) == 2:
-            # default to the v0.1 hand unless the mirror is clearly better
-            best = results[1] if results[1]["contrast"] >= 0.8 * results[-1]["contrast"] else results[-1]
+            # the caller decides whether the better hand is clearly better (contrast_by_hand)
+            best = dict(results[1] if results[1]["contrast"] >= results[-1]["contrast"] else results[-1])
             best["contrast_by_hand"] = {h: r["contrast"] for h, r in results.items()}
         else:
             best = results[hands[0]]
@@ -812,7 +970,7 @@ def _blade_analysis(rect_eq: np.ndarray, centre: tuple[float, float], eye_mask_r
     win = int(max(3, round(0.10 * per)))
     traces = _trace_blades(W, mpol, Z, per, ph, off, cols, win)
 
-    fits, phases, ranges = [], [], []
+    fits, phases, ranges, rejected = [], [], [], []
     gap_cols = max(3, int(0.03 * (c1 - c0)))
     for i, tr in enumerate(traces):
         rng = _support_range(tr, gap_cols)
@@ -822,6 +980,16 @@ def _blade_analysis(rect_eq: np.ndarray, centre: tuple[float, float], eye_mask_r
         cc, rows = tr["col"][sel], tr["row"][sel]
         if len(cc) < max(6, int(0.15 * len(cols))):
             continue
+        if eye is not None or hub_px is not None:
+            phi_t = rows * dphi
+            on_hub = hub_px is not None and float(np.mean(cc < 1.05 * hub_px)) > 0.5
+            on_ring = False
+            if eye is not None:
+                P = np.stack([centre[0] + cc * np.cos(phi_t), centre[1] + cc * np.sin(phi_t)], 1)
+                on_ring = float(np.mean(_ellipse_rho(eye, P) > 0.9 * eye_shrink)) > 0.5
+            if on_hub or on_ring:
+                rejected.append((i, "hub flange" if on_hub else "inlet ring edge"))
+                continue
         # the wedge apex (leading edge) and the lip occlusion distort the first/last few
         # columns (the straight LE line is traced there): trim 5 % at each end for the fit
         k = max(2, int(0.05 * len(cc)))
@@ -838,15 +1006,21 @@ def _blade_analysis(rect_eq: np.ndarray, centre: tuple[float, float], eye_mask_r
         ranges.append(rng)
     out = {"per": per, "H": H, "dphi": dphi, "phase_row": ph, "beta_a0": ba, "beta_b0": bb,
            "score": score, "contrast": contrast, "r_a": r_a, "r_b": r_b, "cols": cols,
-           "fits": fits, "n_traced": len(fits), "traces": traces, "polar": pol, "W_in": W_in,
+           "fits": fits, "n_traced": len(fits), "rejected": rejected, "traces": traces, "polar": pol,
+           "W_in": W_in,
            "W_out": W_out, "W": W, "mask_polar": mpol, "centre": centre, "response": response,
            "hand": hand}
     if fits:
         # keep well-supported, well-fitting blades for the aggregate
         n_max = max(f["n"] for f in fits)
         good = [f for f in fits if f["n"] >= 0.5 * n_max and f["rms_deg"] <= 1.0]
-        if not good:
+        fallback = not good
+        if fallback:
             good = sorted(fits, key=lambda f: f["rms_deg"] / max(f["n"], 1))[:max(2, len(fits) // 2)]
+        # disagreement between ALL traced blades (a wrong trace mixed in is a red flag): IQR of beta_a
+        # (badly fitting / short traces are excluded: they are noise, not disagreement)
+        b_all = np.array([f["beta_a"] for f in fits if f["rms_deg"] <= 2.0 and f["n"] >= 0.4 * n_max])
+        beta_iqr = float(np.percentile(b_all, 75) - np.percentile(b_all, 25)) if len(b_all) >= 3 else 0.0
         A = np.array([[f["beta_a"], f["beta_b"]] for f in good])
         beta_a, beta_b = float(np.median(A[:, 0])), float(np.median(A[:, 1]))
         spread = float(np.median(np.abs(A - np.median(A, axis=0)).max(axis=1)))
@@ -866,7 +1040,10 @@ def _blade_analysis(rect_eq: np.ndarray, centre: tuple[float, float], eye_mask_r
                     "r_min_px": float(np.median([f["r_min_px"] for f in good])),
                     "r_max_px": float(np.median([f["r_max_px"] for f in good])),
                     "phase_resid": np.array(phases), "blade_ids": np.array([f["blade"] for f in fits]),
-                    "n_good": len(good), "joint": joint, "per_blade_median": (beta_a, beta_b)})
+                    "n_good": 0 if fallback else len(good), "good_fallback": fallback,
+                    "beta_iqr_all": beta_iqr,
+                    "beta_a_agree_frac": float(np.mean(np.abs(A[:, 0] - np.median(A[:, 0])) <= 10.0)),
+                    "joint": joint, "per_blade_median": (beta_a, beta_b)})
         if joint is not None and joint["rms_deg"] <= 1.5:
             out["beta_a"], out["beta_b"] = joint["beta_a"], joint["beta_b"]
     return out
@@ -888,7 +1065,9 @@ def _centre_correction(ba: dict[str, Any], s_bp: float) -> tuple[float, float] |
     if not np.isfinite(dx) or not np.isfinite(dy):
         return None
     lim = 0.12 * r_ref
-    return float(np.clip(dx, -lim, lim)), float(np.clip(dy, -lim, lim))
+    if abs(dx) >= lim or abs(dy) >= lim:
+        return None          # a correction that hits its clip limit is a runaway fit, not a correction
+    return float(dx), float(dy)
 
 
 # ---------------------------------------------------------------------------
@@ -978,7 +1157,12 @@ def analyze_rim_image(img: np.ndarray, Z: int, *, marker_hint: Any = None,
     rim radius, perspective-free via the TE spacing at the image centre), ``confidence`` and
     diagnostics.  Raises ValueError when no gap band is found.
     """
+    if isinstance(Z, bool) or not isinstance(Z, (int, np.integer)) or Z < 2:
+        raise ValueError(f"Z must be an integer >= 2 (got {Z!r})")
     gray0 = _to_gray(img)
+    if gray0.shape[0] < _RIM_MIN_H or gray0.shape[1] < _RIM_MIN_W:
+        raise ValueError(f"rim image too small ({gray0.shape[1]}x{gray0.shape[0]} px; need at least "
+                         f"{_RIM_MIN_W}x{_RIM_MIN_H})")
     s = min(1.0, work_width / max(gray0.shape))
     gray = cv2.resize(gray0, None, fx=s, fy=s, interpolation=cv2.INTER_AREA) if s < 1 else gray0
     H, W = gray.shape
@@ -1011,7 +1195,7 @@ def analyze_rim_image(img: np.ndarray, Z: int, *, marker_hint: Any = None,
     horiz = (np.abs(gy_c[:, xs]) > 2.0 * np.abs(gx_c[:, xs])) & \
             (np.abs(gy_c[:, xs]) > 0.25 * float(np.percentile(np.abs(gy_c[:, xs]), 99)))
     Lh = gaussian_filter1d(horiz.mean(axis=1), 1.5)              # fraction of columns with a horizontal edge
-    pk_rows, _ = find_peaks(Lh, prominence=0.08, distance=int(0.02 * H))
+    pk_rows, _ = find_peaks(Lh, prominence=0.08, distance=max(1, int(0.02 * H)))
     pk_rows = [p for p in pk_rows if Lh[p] >= 0.25]
     best_pair = None
     for i, ya in enumerate(pk_rows):
@@ -1055,7 +1239,7 @@ def analyze_rim_image(img: np.ndarray, Z: int, *, marker_hint: Any = None,
     # ---- vertical edges inside the gap -------------------------------------------------
     r0, r1 = int(y_top + 0.15 * hg), int(y_bot - 0.15 * hg)
     V = gaussian_filter1d(np.abs(gx_c[r0:r1 + 1]).mean(axis=0), 1.5)
-    pk, pr = find_peaks(V, prominence=0.10 * float(V.max()), distance=int(0.015 * W))
+    pk, pr = find_peaks(V, prominence=0.10 * float(V.max()), distance=max(1, int(0.015 * W)))
     # ---- inside-the-silhouette test: the rim's lower edge runs across every impeller column
     gy_abs = np.abs(gy_c)
     wt = int(max(3, 0.12 * hg))
@@ -1242,7 +1426,26 @@ def analyze_shrouded(img: np.ndarray, *, outer_diameter_mm: float | None = None,
     handedness  : 'ccw' (blades sweep counter-clockwise with radius seen from the inlet, the
                   v0.1/CAD convention), 'cw' (mirror image) or None = detect from the image.
     """
-    gray = _to_gray(np.asarray(img))
+    if handedness not in (None, "ccw", "cw"):
+        raise ValueError(f"handedness must be None, 'ccw' or 'cw' (got {handedness!r})")
+    if blade_count_hint is not None:
+        if isinstance(blade_count_hint, (float, np.floating)) and float(blade_count_hint).is_integer():
+            blade_count_hint = int(blade_count_hint)
+        if isinstance(blade_count_hint, (bool, np.bool_)) or not isinstance(blade_count_hint, (int, np.integer)) \
+                or not (Z_MIN <= int(blade_count_hint) <= Z_MAX):
+            raise ValueError(f"blade_count_hint must be an integer in [{Z_MIN}, {Z_MAX}] "
+                             f"(got {blade_count_hint!r})")
+        blade_count_hint = int(blade_count_hint)
+    for name_, val_ in (("outer_diameter_mm", outer_diameter_mm), ("eye_diameter_mm", eye_diameter_mm),
+                        ("ref_diameter_mm", ref_diameter_mm), ("blade_width_mm", blade_width_mm),
+                        ("blade_width_inlet_mm", blade_width_inlet_mm), ("focal_px", focal_px)):
+        if val_ is not None and not (np.isfinite(val_) and float(val_) > 0):
+            raise ValueError(f"{name_} must be a positive number (got {val_!r})")
+    if rim_images is not None:
+        for k_, ri_ in enumerate(rim_images):
+            if ri_ is None:
+                raise ValueError(f"rim_images[{k_}] is None (unreadable image file?)")
+    gray = _to_gray(img)
     debug: dict[str, Any] = {}
     warnings: list[str] = []
     prov: dict[str, Provenance] = {}
@@ -1274,12 +1477,25 @@ def analyze_shrouded(img: np.ndarray, *, outer_diameter_mm: float | None = None,
         eye_r = EllipseFit(c_rim, (a_rim * k, a_rim * k), 0.0, 0.0, 0)
     a_eye = float(math.sqrt(eye_r.a * eye_r.b))
     tilt = pose.tilt_from_ellipse(rim)
+    # sanity check of the pair: with the outer rim cut by the frame the inlet ring is promoted to
+    # 'rim' and the bore to 'eye' (apparent eye/rim ratio far below any production impeller)
+    ratio_eye_rim = a_eye / a_rim
+    rim_suspect = False
+    if eye is not None and ratio_eye_rim < 0.42:
+        rim_suspect = True
+        warnings.append(f"picked rim ellipse may be the inlet ring (eye/rim ratio {ratio_eye_rim:.2f} < 0.42; "
+                        "the outer rim leaves the frame?): diameters are unreliable")
+    P_rim = rim.points(n=360)
+    H_, W_ = gray.shape[:2]
+    out_frac = float(np.mean((P_rim[:, 0] < 0) | (P_rim[:, 0] > W_ - 1) | (P_rim[:, 1] < 0) | (P_rim[:, 1] > H_ - 1)))
+    if out_frac > 0.05:
+        warnings.append(f"rim ellipse leaves the image frame ({out_frac * 100:.0f} % of its perimeter): "
+                        "the outer diameter fit may be unreliable")
     debug.update({"M": M, "M_inv": Minv, "rim_rect": rim_r, "eye_rect": eye_r, "tilt_deg": tilt,
                   "px_per_unit": ppu})
 
     # ---- 2. scale ------------------------------------------------------------
     D2_user = outer_diameter_mm
-    ratio_eye_rim = a_eye / a_rim                       # apparent (perspective-enlarged) ratio
     ref_ppm = None
     if ref_diameter_mm is not None:
         from .analyze import _find_reference_circle
@@ -1360,25 +1576,47 @@ def analyze_shrouded(img: np.ndarray, *, outer_diameter_mm: float | None = None,
                                           (0.7 if cam_dist else 0.5) * (1.0 if eye is not None else 0.1),
                                           "inlet ring inner edge" + ("" if cam_dist else " (far camera)"))
 
-    # ---- 3. eye region: hub, bore ---------------------------------------------
+    # ---- 3. eye region: bore (axis anchor), hub ---------------------------------------------
     rect_eq = _clahe(rect)
     # 5 % margin keeps the inlet ring's inner wall (seen under the lip) out of the eye region
     mask_shrink = _ring_wall_shrink(rect, eye_r, debug)
     debug["eye_mask_shrink"] = mask_shrink
     eye_mask = _ellipse_mask(eye_r, rect.shape, shrink=mask_shrink)
-    # The axis point of the backplate plane is unknown (ellipse centres are perspective-shifted
-    # and sit at other heights); start at the rim centre and let the Z-fold symmetry correct it.
-    centre = c_rim
+    # The impeller axis: the ellipse centres of the rim / inlet ring are perspective-shifted
+    # (they sit at other heights) and a free centre search drifts onto whatever folds best
+    # (inlet-ring edge, flange features).  The through-bore is a clean, round, dark blob in the
+    # backplate-side flange: anchor the axis there; without a bore fall back to the rim centre.
+    bore_fit = _find_bore(rect, eye_r, c_rim, debug)
+    anchored = bore_fit is not None
+    centre = bore_fit["centre"] if anchored else c_rim
+    if anchored and math.hypot(centre[0] - c_rim[0], centre[1] - c_rim[1]) <= _BORE_SNAP_FRAC * a_rim:
+        centre = c_rim          # on-axis view: the bore centre is the rim centre within the fit noise
+    debug["bore_fit"] = bore_fit
     r_eye_px = a_eye
+    # blade count / band / hub profiles: polar unwrap about the rim centre (the band geometry is
+    # only needed to ~10 px; the axis proper is used for the blade tracing below)
     # polar radius must cover the whole eye ellipse (off-centre in tilted views)
-    r_cover = float(eye_r.a * 1.02 + math.hypot(eye_r.center[0] - centre[0], eye_r.center[1] - centre[1]))
+    r_cover = float(eye_r.a * 1.02 + math.hypot(eye_r.center[0] - c_rim[0], eye_r.center[1] - c_rim[1]))
     H0 = int(np.clip(round(2 * math.pi * r_cover), 1440, 4096))
-    pol0 = _polar(rect_eq, centre, r_cover, H0)
-    mpol0 = _polar(eye_mask.astype(np.uint8) * 255, centre, r_cover, H0) > 127
-    Z, Z_agree, Z_snr, blade_start, blade_end = _blade_band_and_count(
-        pol0, mpol0, r_eye_px, 0.08 * r_eye_px, blade_count_hint, debug)
+    pol0 = _polar(rect_eq, c_rim, r_cover, H0)                  # CLAHE image: hub / bore profiles
+    # the blade count must not see CLAHE's 8x8 tile grid (centred on the image centre it puts a
+    # spurious 4-fold pattern into a featureless eye): use the raw image - the column spectrum
+    # is whitened per radius, so no further normalisation is needed and nothing depends on
+    # the angle
+    pol0_raw = _polar(rect, c_rim, r_cover, H0)
+    mpol0 = _polar(eye_mask.astype(np.uint8) * 255, c_rim, r_cover, H0) > 127
+    # Z and the evidence for it come from the raw polar image; the blade band (radial extent of
+    # the Z-periodic pattern) is then measured on the CLAHE image at that Z
+    Z, Z_agree, Z_snr, bs_raw, be_raw = _blade_band_and_count(
+        pol0_raw, mpol0, r_eye_px, 0.08 * r_eye_px, blade_count_hint, debug)
+    blade_start = blade_end = None
+    if Z is not None:
+        _, _, _, blade_start, blade_end = _blade_band_and_count(
+            pol0, mpol0, r_eye_px, 0.08 * r_eye_px, blade_count_hint, {}, force_Z=Z)
     debug["blade_band_start_px"], debug["blade_band_end_px"] = blade_start, blade_end
     r_hub_px, hub_conf, r_bore_px = _hub_bore(pol0, mpol0, r_eye_px, blade_start, debug)
+    if anchored:
+        r_bore_px = bore_fit["r_px"]
     if r_hub_px is None:
         hub_mm = PRIOR["hub_over_D2"] * D2_mm
         prov["hub_diameter"] = Provenance(hub_mm, "prior", 0.1, "no hub edge found: 0.3 D2")
@@ -1392,14 +1630,23 @@ def analyze_shrouded(img: np.ndarray, *, outer_diameter_mm: float | None = None,
                                           ("" if hub_height_mm else "; scale at the rim plane assumed"))
     bore_mm = 2.0 * r_bore_px / s_hub if r_bore_px is not None else 0.0
     prov["hub_bore_diameter"] = Provenance(bore_mm, "measured" if r_bore_px is not None else "prior",
-                                           0.5 if r_bore_px is not None else 0.1,
-                                           "dark central blob" if r_bore_px is not None else "not seen")
+                                           (0.6 if anchored else 0.5) if r_bore_px is not None else 0.1,
+                                           ("dark bore, hull ellipse fit" if anchored else "dark central blob")
+                                           if r_bore_px is not None else "not seen")
+    if rim_suspect:
+        for k_ in ("eye_diameter", "hub_diameter", "hub_bore_diameter"):
+            prov[k_].confidence = min(prov[k_].confidence, 0.2)
+            prov[k_].note += "; rim ellipse doubtful"
 
     # ---- 4. blade count --------------------------------------------------------
     c_lo = int(max(r_hub_px * 1.06 + 2, blade_start if blade_start else 0, 0.08 * r_eye_px))
     c_hi = int(blade_end if blade_end else 0.97 * r_eye_px)
     blades_visible = (Z is not None and blade_start is not None and Z_snr >= 3.0
-                      and Z_agree >= 0.35 and c_hi - c_lo >= 6)
+                      and Z_agree >= 0.35 and c_hi - c_lo >= 6
+                      and debug.get("blade_band_amp", 0.0) >= _Z_MIN_AMP)
+    if rim_suspect and not blades_visible:
+        warnings.append("the picked 'rim' looks like the inlet ring and no blade pattern is visible: "
+                        "every length in this result is doubtful")
     if not blades_visible:
         if blade_count_hint is not None:
             Z = int(blade_count_hint)
@@ -1416,55 +1663,96 @@ def analyze_shrouded(img: np.ndarray, *, outer_diameter_mm: float | None = None,
         prov["blade_count"] = Provenance(Z, "measured", conf,
                                          f"periodicity over {c_hi - c_lo} px of radius, SNR {Z_snr:.1f}")
     debug.update({"Z": Z, "blades_visible": blades_visible, "expected_from_eye": 8,
-                  "centre_rect_initial": centre, "r_hub_px": r_hub_px, "r_bore_px": r_bore_px,
-                  "r_eye_px": r_eye_px})
+                  "centre_rect_initial": c_rim, "r_hub_px": r_hub_px, "r_bore_px": r_bore_px,
+                  "r_eye_px": r_eye_px, "axis_anchored_on_bore": anchored})
 
     # ---- 5. blade root tracing ---------------------------------------------------
     ba: dict[str, Any] = {}
     r1_mm = r2_mm = None
     beta1 = beta2x = None
     vis_frac = 0.0
+    hand_user = {"ccw": 1, "cw": -1}.get(handedness)
+    hand_final: int | None = hand_user              # +1 ccw, -1 cw, None = undetermined
+    hand_src = "user" if hand_user else "none"
+    axis_ok = True
+    r2_mm = 0.5 * D2_mm
     if blades_visible:
-        r_lo_px = max(0.1 * r_eye_px, min(r_hub_px * 1.08 + 2, blade_start - 0.02 * r_eye_px),
-                      blade_start - 0.02 * r_eye_px)
+        r_lo_px = max(0.1 * r_eye_px, blade_start - 0.02 * r_eye_px)
         r_hi_px = float(c_hi)
-        # tilt: the eye (higher) and rim centres separate along the tilt direction; the backplate
-        # axis lies on the far side of the rim centre.  Search along that line for the centre
-        # that makes the blade pattern fold most coherently (Z-fold symmetry).
+        # tilt: the eye (higher) and rim centres separate along the tilt direction
         dvec = np.array([c_rim[0] - eye_r.center[0], c_rim[1] - eye_r.center[1]])
         dlen = float(np.linalg.norm(dvec))
         tilted = dlen > 0.02 * a_rim
         response = "abs" if tilted else "entry"
-        kw = dict(r_lo_px=r_lo_px, r_hi_px=r_hi_px, Z=Z, s_bp=s_bp, response=response)
-        # handedness (blade sweep direction) from the better matched-filter contrast
+        # (a prior eye circle - no inlet-ring ellipse found - is a guess, not an edge to hug)
+        kw = dict(r_lo_px=r_lo_px, r_hi_px=r_hi_px, Z=Z, s_bp=s_bp, response=response,
+                  eye=eye_r if eye is not None else None, eye_shrink=mask_shrink, hub_px=r_hub_px)
         band_frac0 = (r_hi_px - r_lo_px) / max(s_bp * 0.5 * D2_mm - r_lo_px, 1e-6)
         yy, xx = np.mgrid[0:rect.shape[0], 0:rect.shape[1]]
         rr_c = np.hypot(xx - centre[0], yy - centre[1])
         ann = (rr_c >= r_lo_px) & (rr_c <= r_hi_px)
         band_cover = float(eye_mask[ann].mean()) if ann.any() else 0.0
         debug["band_angular_coverage"] = band_cover
-        if handedness in ("ccw", "cw"):
-            kw["hand"] = 1 if handedness == "ccw" else -1
-        elif band_frac0 < 0.25 or band_cover < 0.5:
-            kw["hand"] = 1          # too little blade visible to tell the hand: v0.1 convention
-            warnings.append("blade sweep direction not determinable (short or partial visible band); "
-                            "counter-clockwise (v0.1 convention) assumed")
-        else:
-            h0 = _blade_analysis(rect_eq, centre, eye_mask, coarse_only=True, hand=0, **kw)
-            kw["hand"] = int(h0["hand"])
-            debug["hand_contrasts"] = h0.get("contrast_by_hand")
-        debug["hand"] = kw["hand"]
+        short_band = band_frac0 < 0.25 or band_cover < 0.5
+        # --- axis: the bore centre, refined by the Z-fold symmetry within a small radius ---
+        mf_hand = 0 if (hand_user is None and not short_band) else (hand_user or 1)
+        evals: list[tuple[tuple[float, float], dict[str, Any]]] = []
+
+        def coarse(c: tuple[float, float]) -> dict[str, Any]:
+            cs_ = _blade_analysis(rect_eq, c, eye_mask, coarse_only=True, hand=mf_hand, **kw)
+            evals.append((c, cs_))
+            return cs_
+
         search: list[tuple[float, float, tuple[float, float]]] = []
-        if tilted:
+        axis_src = "bore centre" if anchored else "rim centre"
+        if anchored:
+            # parallax: the dark opening is seen at the flange level, the blade roots stand on the
+            # backplate - the two axis points differ along the tilt direction (u).  Search that
+            # line within +-_AXIS_SEARCH_FRAC * a_rim of the bore centre; the Z-fold contrast must
+            # have an interior maximum, a monotonic rise only says 'further' - keep the bore centre
+            L = _AXIS_SEARCH_FRAC * a_rim
+            if tilted:
+                u_ = dvec / dlen
+                # sample the tilt line at the same stations as the free search (rim-centre based:
+                # -0.4 .. 2.5 dlen), but only those within L of the bore
+                t_b = (centre[0] - c_rim[0]) * u_[0] + (centre[1] - c_rim[1]) * u_[1]
+                lam_all = np.linspace(-0.4 * dlen, min(2.5 * dlen, 0.2 * a_rim), 14)
+                step_ = float(lam_all[1] - lam_all[0])
+                lams = np.array([t for t in lam_all if abs(t - t_b) <= L] + [t_b])
+                lams = np.unique(np.round(lams, 6))
+                vals_ = []
+                for t in lams:
+                    c = (centre[0] + (t - t_b) * u_[0], centre[1] + (t - t_b) * u_[1])
+                    vals_.append(coarse(c)["contrast"])
+                k = int(np.argmax(vals_))
+                i_b = int(np.argmin(np.abs(lams - t_b)))
+                if len(lams) < 3 or k == len(lams) - 1 or k == 0:
+                    # still rising at the search limit: the axis lies further away than the
+                    # small neighbourhood we trust - the fold cannot confirm the bore anchor
+                    axis_ok = False
+                    warnings.append("Z-fold contrast still rising at the edge of the axis search around "
+                                    "the bore: the impeller axis is uncertain")
+                elif vals_[k] >= _AXIS_MOVE_GAIN * vals_[i_b]:
+                    y0, y1, y2 = vals_[k - 1], vals_[k], vals_[k + 1]
+                    den = y0 - 2 * y1 + y2
+                    lam_b = float(lams[k]) + (float(np.clip(0.5 * (y0 - y2) / den, -1, 1)) * step_
+                                              if den < 0 else 0.0)
+                    centre = (centre[0] + (lam_b - t_b) * u_[0], centre[1] + (lam_b - t_b) * u_[1])
+                    axis_src = "bore centre + Z-fold refinement along the tilt direction"
+                debug["centre_search_bore"] = [(round(float(l_ - t_b), 1), round(float(v_), 3))
+                                               for l_, v_ in zip(lams, vals_)]
+            else:
+                coarse(centre)
+        elif tilted:
             u = dvec / dlen
-            # the backplate axis lies ~(z_rim - z_bp)/(z_eye - z_rim) ~ 1.7 x dlen beyond the rim
-            # centre, plus the perspective shift of the ellipse centres: search up to 2.5 x dlen
+            # no bore: the backplate axis lies ~(z_rim - z_bp)/(z_eye - z_rim) ~ 1.7 x dlen beyond
+            # the rim centre, plus the perspective shift of the ellipse centres: search up to 2.5 x dlen
             lam_max = min(2.5 * dlen, 0.2 * a_rim)
             for lam in np.linspace(-0.4 * dlen, lam_max, 14):
                 c = (c_rim[0] + lam * u[0], c_rim[1] + lam * u[1])
-                cs = _blade_analysis(rect_eq, c, eye_mask, coarse_only=True, **kw)
-                search.append((float(lam), cs["contrast"], c))
-            k = int(np.argmax([s[1] for s in search]))
+                cs_ = coarse(c)
+                search.append((float(lam), cs_["contrast"], c))
+            k = int(np.argmax([s_[1] for s_ in search]))
             lam_best = search[k][0]
             if 0 < k < len(search) - 1:
                 y0, y1, y2 = search[k - 1][1], search[k][1], search[k + 1][1]
@@ -1472,26 +1760,104 @@ def analyze_shrouded(img: np.ndarray, *, outer_diameter_mm: float | None = None,
                 step = search[1][0] - search[0][0]
                 if den < 0:
                     lam_best += float(np.clip(0.5 * (y0 - y2) / den, -1, 1)) * step
+            else:
+                # the best fold sits at the end of the search line: not a maximum, the axis is
+                # unknown (the fold is then driven by ring / flange features)
+                axis_ok = False
+                warnings.append("axis centre search ran to its boundary (no bore found): the "
+                                "impeller axis is uncertain")
             centre = (c_rim[0] + lam_best * u[0], c_rim[1] + lam_best * u[1])
-            debug["centre_search"] = [(round(s[0], 1), round(s[1], 3)) for s in search]
+            axis_src = "Z-fold line search"
+            debug["centre_search"] = [(round(s_[0], 1), round(s_[1], 3)) for s_ in search]
+        else:
+            coarse(centre)
+        # the evaluation at the final axis (nearest evaluated centre)
+        cs_final = min(evals, key=lambda e_: math.hypot(e_[0][0] - centre[0], e_[0][1] - centre[1]))[1]
+        # --- handedness at the FINAL axis: edge-orientation cue + matched-filter contrast ---
+        cbh = cs_final.get("contrast_by_hand")
+        s_or, e_or = _hand_from_orientation(rect, centre, eye_mask, r_lo_px, r_hi_px)
+        or_hand = (-1 if s_or > 0 else 1) if abs(s_or) >= _HAND_OR_MIN else None
+        mf_h = None
+        ratio_mf = None
+        if cbh:
+            cp, cm = float(cbh[1]), float(cbh[-1])
+            ratio_mf = max(cp, cm) / max(min(cp, cm), 1e-9)
+            if ratio_mf >= _HAND_MF_MARGIN:
+                mf_h = 1 if cp > cm else -1
+        debug["hand_info"] = {"orientation_score": s_or, "orientation_hand": or_hand,
+                              "contrast_by_hand": cbh, "contrast_ratio": ratio_mf, "mf_hand": mf_h,
+                              "short_band": short_band}
+        debug["hand_contrasts"] = cbh
+        if hand_user is None:
+            if short_band:
+                # little blade visible: only a decisive edge-orientation vote is trusted
+                if abs(s_or) >= 0.6:
+                    hand_final, hand_src = (-1 if s_or > 0 else 1), "orientation"
+                else:
+                    hand_final, hand_src = None, "prior"
+            elif or_hand is not None and mf_h is not None and or_hand != mf_h:
+                hand_final, hand_src = None, "conflict"
+            elif or_hand is not None:
+                hand_final, hand_src = or_hand, "orientation" + ("+matched filter" if mf_h else "")
+            elif mf_h is not None:
+                hand_final, hand_src = mf_h, "matched filter"
+            else:
+                hand_final, hand_src = None, "prior"
+            if hand_final is None:
+                warnings.append("blade sweep direction undetermined (edge orientation and template "
+                                "contrast are not decisive); counter-clockwise (v0.1 convention) "
+                                "assumed, blade angles are priors")
+        kw["hand"] = hand_final if hand_final is not None else 1
+        debug["hand"] = kw["hand"]
         ba = _blade_analysis(rect_eq, centre, eye_mask, debug=debug, **kw)
-        # 2-D touch-up from the per-blade phase residuals, kept only if the fold improves
+        # 2-D touch-up from the per-blade phase residuals, kept only if the fold improves; the
+        # correction is refused when it hits its clip limit and may not drag an anchored axis
+        # away from the bore
         corr = _centre_correction(ba, s_bp) if ba.get("n_traced", 0) >= 4 else None
         debug["centre_correction_px"] = corr
         if corr is not None and math.hypot(*corr) > 0.5:
             centre2 = (centre[0] + corr[0], centre[1] + corr[1])
-            ba2 = _blade_analysis(rect_eq, centre2, eye_mask, debug=debug, **kw)
-            if ba2.get("n_traced", 0) >= max(3, ba.get("n_traced", 0) - 1) and \
-                    ba2["contrast"] >= ba["contrast"] and \
-                    ba2.get("beta_spread", 99) <= ba.get("beta_spread", 99) * 1.2 + 0.5:
-                ba = ba2
-                centre = centre2
-                debug["centre_correction2_px"] = _centre_correction(ba, s_bp)
+            drift_ok = (not anchored) or math.hypot(centre2[0] - bore_fit["centre"][0],
+                                                    centre2[1] - bore_fit["centre"][1]) \
+                <= 1.1 * _AXIS_SEARCH_FRAC * a_rim
+            if drift_ok:
+                ba2 = _blade_analysis(rect_eq, centre2, eye_mask, debug=debug, **kw)
+                if ba2.get("n_traced", 0) >= max(3, ba.get("n_traced", 0) - 1) and \
+                        ba2["contrast"] >= ba["contrast"] and \
+                        ba2.get("beta_spread", 99) <= ba.get("beta_spread", 99) * 1.2 + 0.5:
+                    ba = ba2
+                    centre = centre2
+                    debug["centre_correction2_px"] = _centre_correction(ba, s_bp)
         debug["blade_analysis"] = ba
-        debug["centre_rect"] = centre
         debug["tilted_view"] = tilted
-    r2_mm = 0.5 * D2_mm
-    if ba.get("n_traced", 0) >= max(2, Z // 3):
+        debug["axis"] = {"source": axis_src, "anchored": anchored, "ok": axis_ok,
+                         "offset_from_bore_px": (math.hypot(centre[0] - bore_fit["centre"][0],
+                                                            centre[1] - bore_fit["centre"][1])
+                                                 if anchored else None)}
+    debug["centre_rect"] = centre
+    debug["handedness"] = {"value": hand_final, "source": hand_src}
+    # ---- beta1 is only 'measured' when the traces are trustworthy ------------------------
+    reasons: list[str] = []
+    if blades_visible:
+        if "beta_a" not in ba or ba.get("n_traced", 0) == 0:
+            reasons.append("no blade could be traced")
+        else:
+            n_need = max(2, Z // 3)
+            if ba["n_good"] < n_need:
+                reasons.append(f"only {ba['n_good']} of {ba['n_traced']} traced blades fit well "
+                               f"(need {n_need} of {Z})")
+            if ba.get("beta_iqr_all", 0.0) > 15.0:
+                reasons.append(f"traced blades disagree (beta IQR {ba['beta_iqr_all']:.0f} deg)")
+            elif ba.get("beta_a_agree_frac", 1.0) < 0.7:
+                reasons.append(f"the well-fitting blades disagree on beta1 (only "
+                               f"{ba['beta_a_agree_frac'] * 100:.0f} % within 10 deg of the median)")
+        if hand_final is None:
+            reasons.append("sweep direction undetermined")
+        if not axis_ok:
+            reasons.append("axis not located")
+        if ba.get("rejected"):
+            debug["traces_rejected"] = ba["rejected"]
+    if blades_visible and not reasons:
         r_a, r_b = ba["r_a"], ba["r_b"]
         beta_a, beta_b = ba["beta_a"], ba["beta_b"]
         slope = (beta_b - beta_a) / (r_b - r_a)
@@ -1523,7 +1889,7 @@ def analyze_shrouded(img: np.ndarray, *, outer_diameter_mm: float | None = None,
         debug["slope"] = {"fit": slope, "prior": slope_prior, "weight": w_slope, "band_frac": band_frac}
         prov["blade_angle_inlet"] = Provenance(beta1, "measured", 0.9 * fitq,
                                                f"{ba['n_good']}/{Z} blades, spread {ba['beta_spread']:.1f} deg")
-        if ba.get("hand", 1) == -1:
+        if hand_final == -1:
             warnings.append("blades sweep clockwise with radius (seen from the inlet): mirror image of "
                             "the v0.1/CAD convention; angles are reported for the mirrored blade")
         prov["blade_angle_outlet"] = Provenance(beta2x, "extrapolated", vis_frac * fitq * (0.5 + 0.5 * w_slope),
@@ -1531,8 +1897,15 @@ def analyze_shrouded(img: np.ndarray, *, outer_diameter_mm: float | None = None,
                                                 + (f", slope shrunk toward prior (w={w_slope:.2f})" if w_slope < 0.8 else ""))
     else:
         if blades_visible:
-            warnings.append(f"only {ba.get('n_traced', 0)} of {Z} blades could be traced; angles are priors")
-        r1_mm = PRIOR["eye_over_D2"] * r2_mm if r1_mm is None else r1_mm
+            warnings.append("blade angles are priors, not measured: " + "; ".join(reasons))
+            if "beta_a" in ba:
+                debug["beta1_rejected"] = {"beta_a": ba["beta_a"], "beta_b": ba["beta_b"],
+                                           "n_good": ba["n_good"], "n_traced": ba["n_traced"],
+                                           "reasons": reasons}
+            if hand_final == -1:
+                warnings.append("blades appear to sweep clockwise (seen from the inlet): mirror image of "
+                                "the v0.1/CAD convention")
+        r1_mm = PRIOR["eye_over_D2"] * r2_mm
         prov["inner_diameter"] = Provenance(2 * r1_mm, "prior", 0.1, "LE hidden: D1 := eye diameter prior")
         beta1, beta2x = PRIOR["beta1_deg"], PRIOR["beta2_deg"]
         prov["blade_angle_inlet"] = Provenance(beta1, "prior", 0.05, "typical backward-curved")
@@ -1574,16 +1947,21 @@ def analyze_shrouded(img: np.ndarray, *, outer_diameter_mm: float | None = None,
             warnings.append("marker not found in the axial image; wrap-angle beta2 skipped")
         elif not good:
             warnings.append("no rim image yielded a marker + trailing edges; wrap-angle beta2 skipped")
-        elif beta1 is None or "fits" not in ba or not ba["fits"]:
-            warnings.append("no blade traces in the axial image; wrap-angle beta2 skipped")
+        elif prov["blade_angle_inlet"].source != "measured" or "fits" not in ba or not ba["fits"]:
+            warnings.append("beta1 not measured from the axial image; wrap-angle beta2 skipped")
         else:
             pitch = 360.0 / Z
             # LE phase relative to the marker: theta of each blade at r1 (template phase + fit offset)
             ph_row, per, dphi = ba["phase_row"], ba["per"], ba["dphi"]
             r_a = ba["r_a"]
-            # theta at r1 along the fitted camber (from r_a down to r1)
+            # the per-blade theta_offset is the blade angle at r_a (the camber model starts
+            # there), the wrap model integrates from r1: carry the phase from r_a to r1 along
+            # the fitted camber (r1 = innermost traced radius >= r_a, so the sweep is positive)
             th_a_to_r1 = 0.0
-            if r1_mm < r_a:
+            if r1_mm > r_a + 1e-9:
+                _, th = geometry.camber_line(r_a, r1_mm, ba["beta_a"], beta1, n=64)
+                th_a_to_r1 = float(th[-1])
+            elif r1_mm < r_a - 1e-9:
                 _, th = geometry.camber_line(r1_mm, r_a, beta1, ba["beta_a"], n=64)
                 th_a_to_r1 = -float(th[-1])
             hand = ba["hand"]
@@ -1621,13 +1999,23 @@ def analyze_shrouded(img: np.ndarray, *, outer_diameter_mm: float | None = None,
             if chosen is None:
                 warnings.append("wrap angle not attainable with the measured beta1; keeping extrapolated beta2")
             else:
-                wrap_deg, beta2 = chosen
+                wrap_deg, beta2_w = chosen
                 amb = abs(cands[0] - est_wrap)
                 conf = float(np.mean(w)) * (1.0 if amb < pitch / 3 else 0.6) * (1.0 if te_scatter < 3 else 0.6)
-                prov["blade_angle_outlet"] = Provenance(beta2, "wrap", conf,
-                                                        f"wrap {wrap_deg:.1f} deg from {len(good)} rim image(s)"
-                                                        f" (extrapolated {beta2x:.1f} deg)")
-                debug["wrap"].update({"wrap_deg": wrap_deg, "beta2_wrap": beta2})
+                debug["wrap"].update({"wrap_deg": wrap_deg, "beta2_wrap": beta2_w})
+                if cam_dist is None:
+                    # the wrap integral depends on r1 in the BACKPLATE scale (ln(r2/r1)/tan beta):
+                    # with a single known length the close-camera enlargement is uncorrected, a 17 %
+                    # error in r1 moves beta2 by ~15 deg - worse than the extrapolated value
+                    debug["wrap"]["rejected"] = "no perspective correction (single known length)"
+                    warnings.append(f"wrap-angle beta2 = {beta2_w:.1f} deg (conf {conf:.2f}) not used: only one "
+                                    "known length, backplate scale uncorrected; keeping extrapolated beta2 "
+                                    f"{beta2x:.1f} deg (give outer_diameter_mm AND eye_diameter_mm, or focal_px)")
+                else:
+                    beta2 = beta2_w
+                    prov["blade_angle_outlet"] = Provenance(beta2, "wrap", conf,
+                                                            f"wrap {wrap_deg:.1f} deg from {len(good)} rim image(s)"
+                                                            f" (extrapolated {beta2x:.1f} deg)")
 
     # ---- 7. blade widths ----------------------------------------------------------------
     if blade_width_mm is not None:
@@ -1657,11 +2045,10 @@ def analyze_shrouded(img: np.ndarray, *, outer_diameter_mm: float | None = None,
     D1 = 2.0 * r1_mm
     D_eye = prov["eye_diameter"].value
     hub = prov["hub_diameter"].value
-    # clamp into a valid ordering
+    # clamp into a valid ordering (provenance is re-synchronised with every clamped value below)
     if not hub < D1:
         warnings.append(f"hub {hub:.1f} >= D1 {D1:.1f}: hub clamped to 0.9 D1")
         hub = 0.9 * D1
-        prov["hub_diameter"] = Provenance(hub, "prior", 0.1, "clamped below D1")
     if not D1 < D2_mm:
         warnings.append("D1 >= D2: D1 clamped")
         D1 = 0.8 * D2_mm
@@ -1670,10 +2057,20 @@ def analyze_shrouded(img: np.ndarray, *, outer_diameter_mm: float | None = None,
         D_eye = float(np.clip(D_eye, hub * 1.05, D2_mm))
     bore = prov["hub_bore_diameter"].value
     if bore >= hub:
+        warnings.append(f"bore {bore:.1f} >= hub {hub:.1f}: bore dropped")
         bore = 0.0
     b1_ang = float(np.clip(beta1, 1.0, 179.0))
     b2_ang = float(np.clip(beta2, 1.0, 179.0))
     t_mm = min(t_mm, 0.24 * (0.5 * D2_mm - 0.5 * D1))
+    final_vals = {"outer_diameter": D2_mm, "inner_diameter": D1, "hub_diameter": hub,
+                  "eye_diameter": D_eye, "hub_bore_diameter": bore, "blade_angle_inlet": b1_ang,
+                  "blade_angle_outlet": b2_ang, "blade_thickness": t_mm, "blade_width": b2,
+                  "blade_width_inlet": b1, "shroud_cone_height": cone, "shroud_inlet_height": ring}
+    for k_, v_ in final_vals.items():
+        old_ = prov[k_]
+        if abs(old_.value - v_) > 1e-6 * max(1.0, abs(v_)):
+            prov[k_] = Provenance(v_, "prior", min(old_.confidence, 0.1),
+                                  f"clamped from {old_.value:.4g} ({old_.source}) to a valid range")
     params = ImpellerParams(
         outer_diameter=round(D2_mm, 3), inner_diameter=round(D1, 3), hub_diameter=round(hub, 3),
         blade_count=int(Z), blade_angle_inlet=round(b1_ang, 2), blade_angle_outlet=round(b2_ang, 2),
@@ -1685,7 +2082,8 @@ def analyze_shrouded(img: np.ndarray, *, outer_diameter_mm: float | None = None,
         meta={"source": "fanscan.shrouded", "warnings": warnings,
               "px_per_mm_rim": float(s_rim), "px_per_mm_backplate": float(s_bp),
               "camera_distance_mm": cam_dist, "tilt_deg": float(tilt),
-              "handedness": {1: "ccw", -1: "cw"}.get(ba.get("hand", 1), "ccw"),
+              "handedness": {1: "ccw", -1: "cw"}.get(hand_final, "undetermined"),
+              "handedness_source": hand_src,
               "visible_blade_fraction": float(vis_frac),
               "provenance": {k: v.to_dict() for k, v in prov.items()},
               "per_blade_beta": [[round(f["beta_a"], 2), round(f["beta_b"], 2)] for f in ba.get("fits", [])],
@@ -1823,6 +2221,10 @@ def _main(argv: list[str]) -> int:
         print("cannot read", a.image, file=sys.stderr)
         return 2
     rims = [cv2.imread(pth) for pth in a.rim_image]
+    for pth, rim_img in zip(a.rim_image, rims):
+        if rim_img is None:
+            print("cannot read rim image", pth, file=sys.stderr)
+            return 2
     res = analyze_shrouded(img, outer_diameter_mm=a.outer_diameter_mm, eye_diameter_mm=a.eye_diameter_mm,
                            blade_width_mm=a.blade_width_mm, blade_count_hint=a.blade_count_hint,
                            rim_images=rims or None, marker_hint=a.marker, focal_px=a.focal_px)

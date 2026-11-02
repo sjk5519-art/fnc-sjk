@@ -342,9 +342,8 @@ def test_clutter_subset_mostly_measured():
     assert all(r["z_ok"] for r in CLUTTER_RESULTS if r["z_src"] == "measured")
 
 
-@pytest.mark.xfail(strict=True, reason="known miscount: Z9 b40 axial_far + clutter -> Z = 5 "
-                                       "'measured' with confidence 0.69 (2026-11-02)")
-def test_clutter_known_miscount(render_cache):
+def test_clutter_z9_b40_axial_far_no_longer_miscounts(render_cache):
+    # Was an xfail (Z = 5 'measured', conf 0.69) until the raw-polar blade count replaced the CLAHE one.
     Z, beta2, preset = CLUTTER_KNOWN_MISCOUNT
     img, truth, p = _grid_render(render_cache, Z, beta2, preset, clutter=True)
     res = shrouded.analyze_shrouded(img, outer_diameter_mm=p.outer_diameter, eye_diameter_mm=p.eye_diameter)
@@ -395,9 +394,8 @@ def test_wrap_angle_beta2(render_cache, Z, beta2):
     assert abs(est.blade_width - p.b2) / p.b2 <= B2_RIM_GAP_TOL, f"b2: truth {p.b2} est {est.blade_width}"
 
 
-@pytest.mark.xfail(strict=True, reason="known bias: Z13 b30 wrap 99.9 deg vs truth 90.9 -> beta2 "
-                                       "26.55 deg, 3.45 deg off (2026-11-02)")
-def test_wrap_angle_known_bias(render_cache):
+def test_wrap_angle_z13_b30(render_cache):
+    # Was an xfail (3.45 deg off) until the wrap path carried the LE phase from r_a to r1 correctly.
     Z, beta2 = WRAP_KNOWN_BIAS
     res, p, img = _analyze_wrap(render_cache, Z, beta2)
     assert _prov(res, "blade_angle_outlet")[1] == "wrap"
@@ -485,7 +483,7 @@ def test_d2_only_close_camera_bias(render_cache):
 # ---------------------------------------------------------------------------
 def test_real_axial_sample():
     """samples/real_axial_eye.jpg (phone photo through the eye, tilted, cluttered desk; 8 blades
-    by eye): rim + inlet ring found, Z = 8 'measured', beta1 plausible, blades sweep clockwise,
+    by eye): rim + inlet ring found, Z = 8 'measured', beta1/beta2 honestly 'prior', blades sweep clockwise,
     runtime < 15 s, overlay of the same shape.  No ground truth beyond the blade count."""
     img = cv2.imread(str(REAL_AXIAL), cv2.IMREAD_GRAYSCALE)
     assert img is not None
@@ -501,14 +499,18 @@ def test_real_axial_sample():
     v, src, conf = _prov(res, "blade_count")
     assert src == "measured" and res.params.blade_count == 8, (res.params.blade_count, src, conf)
     assert res.debug["expected_from_eye"] == 8
+    # beta1 / beta2 CANNOT be measured reliably from this photo: the traceable blades disagree (beta_a 46/87/83 deg on
+    # three well-fitting blades) and only ~1/3 of the span is visible.  The analyzer must say so (prior, low confidence)
+    # rather than return a confident number -- the earlier 'measured 30.5 deg, conf 0.26' came from a trace that
+    # followed the inlet-ring edge and moved by 45-69 deg under an axis move or a 90 deg rotation.
     v, src, conf = _prov(res, "blade_angle_inlet")
-    assert src == "measured" and 20.0 <= res.params.blade_angle_inlet <= 40.0, (v, conf)
+    assert src == "prior" and conf <= 0.15, (v, src, conf)
     print(f"\n[test_shrouded] real photo: Z {res.params.blade_count} (conf {_prov(res, 'blade_count')[2]:.2f}), "
           f"beta1 {res.params.blade_angle_inlet:.1f} deg (conf {conf:.2f}), beta2 "
           f"{res.params.blade_angle_outlet:.1f} ({_prov(res, 'blade_angle_outlet')[1]}, conf "
           f"{_prov(res, 'blade_angle_outlet')[2]:.2f}), {dt:.1f} s")
     v, src, conf = _prov(res, "blade_angle_outlet")
-    assert src == "extrapolated" and conf <= 0.3          # ~1/3 of the span visible, 1 blade traced
+    assert src == "prior" and conf <= 0.15
     assert res.params.meta.get("handedness") == "cw"
     v, src, conf = _prov(res, "outer_diameter")
     assert src == "prior" and conf <= 0.1 and v == pytest.approx(300.0)
