@@ -1,2 +1,0 @@
-[console_scripts]
-fanscan = fanscan.cli:main

@@ -1,7 +1,0 @@
-numpy>=2.0
-opencv-python-headless>=4.10
-scipy>=1.14
-cadquery>=2.4
-
-[dev]
-pytest>=8
