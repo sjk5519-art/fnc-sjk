@@ -47,6 +47,13 @@ _REF_PAD_PX = 12           # gap between the image border and the reference circ
 _REF_GAP_PX = 10           # minimum clearance between reference circle and backplate
 _CAMBER_SAMPLES = 96       # samples along the camber line per blade polygon
 _FIXED_POINT_SHIFT = 6     # sub-pixel precision bits for cv2.fillPoly / cv2.circle
+# OpenCV fills are boundary-inclusive (plus an anti-aliasing fringe): a polygon
+# of geometric width W covers ~W + 1.4 px, a circle of radius R has an
+# intensity-weighted radius of ~R + 0.6 px.  Shrink the shapes by this much so
+# the drawn footprint matches the geometry the truth dict reports.
+_POLY_EDGE_PX = 0.7        # per side, for cv2.fillPoly
+_CIRCLE_EDGE_PX = 0.5      # radius, for cv2.circle
+_MIN_DRAWN_WIDTH_PX = 0.5  # never shrink a blade polygon below this width
 
 
 def _to_px(x_mm: np.ndarray, y_mm: np.ndarray, cx: float, cy: float, s: float
@@ -107,31 +114,38 @@ def render(params: ImpellerParams, px_per_mm: float = 4.0, ref_diameter_mm: floa
     size, cx, cy = lay["size"], lay["cx"], lay["cy"]
     img = np.full((size, size), BACKGROUND_LEVEL, dtype=np.uint8)
 
+    def disc(c: tuple[float, float], r_px: float, level: int) -> None:
+        """Filled circle whose drawn footprint has radius *r_px*."""
+        r_draw = max(r_px - _CIRCLE_EDGE_PX, 0.5)
+        cv2.circle(img, tuple(int(v) for v in _fixed(list(c))), int(_fixed(r_draw)),
+                   level, thickness=-1, lineType=cv2.LINE_AA, shift=_FIXED_POINT_SHIFT)
+
     # Backplate disc (light), r <= r2 + rim margin.
-    cv2.circle(img, tuple(int(v) for v in _fixed([cx, cy])), int(_fixed(lay["disc_r_px"])),
-               BACKPLATE_LEVEL, thickness=-1, lineType=cv2.LINE_AA, shift=_FIXED_POINT_SHIFT)
+    disc((cx, cy), lay["disc_r_px"], BACKPLATE_LEVEL)
 
     # Blades (dark), one camber line rotated Z times.  Polygons are built in mm
-    # in the y-up math frame and mapped to the y-down image frame.
+    # in the y-up math frame and mapped to the y-down image frame.  The polygon
+    # is offset by the fill's boundary excess so the drawn width equals
+    # blade_thickness (see _POLY_EDGE_PX).
     r_mm, theta = camber_line(params.r1, params.r2, params.blade_angle_inlet,
                               params.blade_angle_outlet, n=_CAMBER_SAMPLES)
+    t_px = params.blade_thickness * s
+    t_draw_mm = max(t_px - 2.0 * _POLY_EDGE_PX, min(t_px, _MIN_DRAWN_WIDTH_PX)) / s
     rot = math.radians(rotation_deg)
     Z = params.blade_count
     for i in range(Z):
-        poly_mm = offset_camber(r_mm, theta, params.blade_thickness,
+        poly_mm = offset_camber(r_mm, theta, t_draw_mm,
                                 theta0=2.0 * math.pi * i / Z + rot)
         poly_px = _to_px(poly_mm[:, 0], poly_mm[:, 1], cx, cy, s)
         cv2.fillPoly(img, [_fixed(poly_px).reshape(-1, 1, 2)], BLADE_LEVEL,
                      lineType=cv2.LINE_AA, shift=_FIXED_POINT_SHIFT)
 
     # Hub boss (mid-dark) on top of everything inside r_hub.
-    cv2.circle(img, tuple(int(v) for v in _fixed([cx, cy])), int(_fixed(params.r_hub * s)),
-               HUB_LEVEL, thickness=-1, lineType=cv2.LINE_AA, shift=_FIXED_POINT_SHIFT)
+    disc((cx, cy), params.r_hub * s, HUB_LEVEL)
 
     # Scale reference: solid white circle, top-left, fully outside the impeller.
     rcx, rcy = lay["ref_c"]
-    cv2.circle(img, tuple(int(v) for v in _fixed([rcx, rcy])), int(_fixed(lay["ref_r_px"])),
-               REF_LEVEL, thickness=-1, lineType=cv2.LINE_AA, shift=_FIXED_POINT_SHIFT)
+    disc((rcx, rcy), lay["ref_r_px"], REF_LEVEL)
 
     # Degradations: blur first (optics), then sensor noise.
     if blur_sigma > 0:

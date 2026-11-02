@@ -3,9 +3,12 @@
 Pipeline (see SPEC "Module: fanscan/analyze.py"):
 
 1. scale        - white reference circle of known diameter (or ``outer_diameter_mm``)
-2. centre/disc  - Otsu threshold, largest contour, least-squares circle fit
-3. radial       - ``cv2.warpPolar`` -> mean / std vs r -> blade annulus (r1, r2), hub
-4. blade count  - harmonic-sum spectrum of angular profiles at several radii, majority vote
+2. centre/disc  - Otsu threshold, largest contour, circle fit of its convex hull anchored
+                  on ``cv2.minEnclosingCircle`` (blade grooves cannot pull it inward)
+3. radial       - ``cv2.warpPolar`` -> mean / variance vs r -> blade annulus (r1, r2), hub;
+                  re-unwrapped wider when the annulus runs into the radius limit
+4. blade count  - harmonic-comb spectrum score at several radii (noise floor subtracted),
+                  majority vote, cross-checked by a direct count of the angular minima
 5. tracing      - per-radius angular minima linked into Z traces, ``geometry.fit_linear_beta``
 6. thickness    - half-depth width of the dark ridge at mid radius, obliquity corrected
 7. blade width  - not observable; use the hint or 0.2 * D2 with a warning
@@ -55,14 +58,39 @@ class AnalysisResult:
 # helpers
 # ---------------------------------------------------------------------------
 def _to_gray(img: np.ndarray) -> np.ndarray:
+    """Any image -> 8-bit single channel, rescaling by dtype rather than clipping.
+
+    ``cv2.imread(..., IMREAD_UNCHANGED)`` hands 16-bit PNGs to us as uint16 and
+    callers may pass float images in [0, 1]; clipping those to [0, 255] would
+    saturate / flatten the whole image.
+    """
+    img = np.asarray(img)
+    if img.ndim == 3 and img.shape[2] == 1:
+        img = img[:, :, 0]
+    if img.dtype != np.uint8:
+        f = img.astype(np.float64)
+        if img.dtype == np.bool_:
+            f = f * 255.0
+        elif np.issubdtype(img.dtype, np.integer):
+            hi = float(f.max()) if f.size else 0.0
+            if hi > 255.0:
+                # 16-bit container: scale by its range; anything wider by the data range
+                full = float(np.iinfo(img.dtype).max)
+                f = f * (255.0 / (full if full <= 65535.0 else hi))
+        else:                                   # float: [0,1] or [0,255]
+            hi = float(np.nanmax(f)) if f.size else 0.0
+            if hi <= 1.0:
+                f = f * 255.0
+            elif hi > 255.0:
+                lo = float(np.nanmin(f))
+                f = (f - lo) * (255.0 / max(hi - lo, 1e-12))
+        img = np.clip(np.rint(np.nan_to_num(f)), 0, 255).astype(np.uint8)
     if img.ndim == 3:
         if img.shape[2] == 4:
-            img = cv2.cvtColor(img, cv2.COLOR_BGRA2GRAY)
+            img = cv2.cvtColor(np.ascontiguousarray(img), cv2.COLOR_BGRA2GRAY)
         else:
-            img = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-    if img.dtype != np.uint8:
-        img = np.clip(img, 0, 255).astype(np.uint8)
-    return img
+            img = cv2.cvtColor(np.ascontiguousarray(img), cv2.COLOR_BGR2GRAY)
+    return np.ascontiguousarray(img)
 
 
 def _fit_circle(pts: np.ndarray) -> tuple[float, float, float]:
@@ -153,17 +181,36 @@ def _find_disc(gray: np.ndarray, ref: tuple[float, float, float] | None,
         raise ValueError("no backplate disc found (empty threshold image)")
     c = max(contours, key=cv2.contourArea)
     pts = c.reshape(-1, 2).astype(float)
+    # Otsu separates the dark blades/hub from the light backplate, not the
+    # backplate from the background, so the blades are holes in the mask.  When
+    # the backplate ring beyond the blade tips is thinner than the median/open
+    # footprint those holes open to the outside and the external contour runs
+    # down every blade groove.  Fit the *convex hull* (rim points only) and
+    # anchor the inlier selection on cv2.minEnclosingCircle, a hull property
+    # that the grooves cannot pull inward, instead of on a Kasa fit of the
+    # notched contour (which is biased inward and then "confirms" itself).
+    hull = cv2.convexHull(c).reshape(-1, 2).astype(float)
     (mx, my), mr = cv2.minEnclosingCircle(c)
-    cx, cy, r = _fit_circle(pts)
-    # Robust re-fit: drop contour points far from the first fit (ref circle
-    # fragments, noise blobs touching the rim).
-    d = np.hypot(pts[:, 0] - cx, pts[:, 1] - cy)
-    keep = np.abs(d - r) < max(3.0, 0.03 * r)
+    mx, my, mr = float(mx), float(my), float(mr)
+    raw_fit = _fit_circle(pts)
+    d = np.hypot(hull[:, 0] - mx, hull[:, 1] - my)
+    keep = np.abs(d - mr) < max(3.0, 0.03 * mr)
     if keep.sum() > 20:
-        cx, cy, r = _fit_circle(pts[keep])
+        cx, cy, r = _fit_circle(hull[keep])
+        # second, tighter pass referenced to the (now unbiased) fit
+        d = np.hypot(hull[:, 0] - cx, hull[:, 1] - cy)
+        keep2 = np.abs(d - r) < max(2.0, 0.015 * r)
+        if keep2.sum() > 20:
+            cx, cy, r = _fit_circle(hull[keep2])
+    else:
+        cx, cy, r = mx, my, mr
+    if abs(r - mr) > 0.05 * mr or math.hypot(cx - mx, cy - my) > 0.05 * mr:
+        cx, cy, r = mx, my, mr            # fit disagrees with the hull -> trust the hull
     debug["disc"] = {"otsu_threshold": float(thr), "center": (cx, cy), "r_px": r,
-                     "min_enclosing": ((float(mx), float(my)), float(mr)),
-                     "contour_points": int(len(pts))}
+                     "min_enclosing": ((mx, my), mr),
+                     "raw_contour_fit": {"center": raw_fit[:2], "r_px": raw_fit[2]},
+                     "contour_points": int(len(pts)), "hull_points": int(len(hull)),
+                     "hull_inliers": int(keep.sum())}
     if r < 10:
         raise ValueError("backplate disc too small to analyse")
     return cx, cy, r
@@ -182,9 +229,16 @@ def _polar(gray: np.ndarray, cx: float, cy: float, max_r: float
 
 
 def _edge_cross(prof: np.ndarray, i0: int, level: float, direction: int) -> float:
-    """Walk from index i0 in *direction* until *prof* crosses *level*; sub-sample."""
+    """Walk from index i0 in *direction* until *prof* crosses *level*; sub-sample.
+
+    Returns NaN when the walk runs off the end of the array without a crossing,
+    so callers can tell "no edge inside the profile" from a real edge at the
+    last sample.
+    """
     n = len(prof)
-    i = i0
+    i = int(i0)
+    if not 0 <= i < n:
+        return float("nan")
     above = prof[i] > level
     while 0 <= i + direction < n:
         j = i + direction
@@ -193,26 +247,59 @@ def _edge_cross(prof: np.ndarray, i0: int, level: float, direction: int) -> floa
             t = (level - a) / (b - a) if b != a else 0.5
             return float(i + direction * t)
         i = j
-    return float(i)
+    return float("nan")
 
 
-def _blade_band(std_prof: np.ndarray, disc_r: float, debug: dict[str, Any]
-                ) -> tuple[float, float, float]:
+def _ramp_top(prof: np.ndarray, start: int, direction: int, max_len: int) -> int:
+    """Index where *prof* stops rising when walking from *start* in *direction*."""
+    n = len(prof)
+    i = int(start)
+    for _ in range(max(int(max_len), 0)):
+        j = i + direction
+        if not (0 <= j < n) or prof[j] <= prof[i]:
+            break
+        i = j
+    return i
+
+
+def _blade_band(std_prof: np.ndarray, disc_r: float, debug: dict[str, Any],
+                cov_prof: np.ndarray | None = None) -> tuple[float, float, float]:
     """Inner/outer edge of the high-angular-variance annulus -> (r1, r2, contrast).
 
     Works on the *variance* (std^2): for a two-level row the variance is linear
     in the blade coverage fraction, so the half-level crossing sits at half
     coverage, i.e. at the blade end itself.  (std ~ sqrt(coverage) would bias
     the edge inward/outward by a fraction of the blade thickness.)
+
+    The floor is taken from radii known to be *outside* the annulus (the eye /
+    hub region and the rim beyond ``disc_r``, i.e. the lowest part of the
+    profile) and the coarse threshold sits close to it, because the blade
+    coverage - and hence the variance - decays roughly as 1/(r sin beta)
+    across the band: long blades would otherwise be truncated at the radius
+    where the decaying variance drops below a fraction of the peak.
+    ``debug["band"]["touches_limit"]`` reports an outer edge that ran into the
+    end of the unwrapped radius range (no crossing found).
+
+    *cov_prof* (optional) is a profile that is *linear* in the blade coverage,
+    e.g. ``percentile75(row) - mean(row)``: the variance ``c (1 - c) delta^2``
+    is only linear for small coverage, so for long blades near a small eye
+    (c ~ 0.3 at r1) its half level sits inside the blade end.  When given, the
+    sub-pixel edge refinement runs on *cov_prof*; the variance still drives the
+    coarse band detection.
     """
     s = gaussian_filter1d(std_prof.astype(np.float64) ** 2, 1.5)
     lim = int(min(disc_r, len(s) - 1))
+    if lim <= 12:
+        raise ValueError("backplate disc too small to analyse")
     valid = s[3:lim]
-    floor = float(np.percentile(valid, 20))
+    floor = float(np.percentile(valid, 5))
+    outside = s[lim + 3:]
+    if len(outside) >= 4:
+        floor = min(floor, float(np.median(outside)))
     peak = float(np.percentile(valid, 90))
     if peak - floor < 16.0:      # std contrast < 4 grey levels
         raise ValueError("no blade pattern found (angular variance is flat)")
-    thr = floor + 0.4 * (peak - floor)
+    thr = floor + 0.15 * (peak - floor)
     above = s > thr
     above[:3] = False
     above[lim:] = False
@@ -232,16 +319,60 @@ def _blade_band(std_prof: np.ndarray, disc_r: float, debug: dict[str, Any]
     width = b - a
     if width < 8:
         raise ValueError("blade annulus too narrow")
-    # refine each edge at the half level between the floor and the local band level
-    inner_lvl = float(np.median(s[a + max(2, width // 10): a + max(4, width // 4)]))
-    outer_lvl = float(np.median(s[b - max(4, width // 4): b - max(2, width // 10) + 1]))
-    r1 = _edge_cross(s, a + max(2, width // 10), 0.5 * (floor + inner_lvl), -1)
-    r2 = _edge_cross(s, b - max(2, width // 10), 0.5 * (floor + outer_lvl), +1)
+    # Refine each edge at the half level between the floor and the *local* band
+    # level.  The level is read at the top of the edge ramp (where the profile
+    # stops rising when walking in from the coarse edge): the variance decays
+    # across a long band, so a window proportional to the band width would
+    # read a level far below the one at the edge and bias the edge inward.
+    i_in0, i_in1 = a + max(2, width // 10), a + max(4, width // 4)
+    i_out0, i_out1 = b - max(4, width // 4), b - max(2, width // 10) + 1
+    k_in = _ramp_top(s, a, +1, width // 2)
+    k_out = _ramp_top(s, b, -1, width // 2)
+    if k_in > a and k_in < k_out:
+        inner_lvl = float(np.median(s[k_in:min(k_in + 3, k_out + 1)]))
+        start_in = k_in
+    else:
+        inner_lvl = float(np.median(s[i_in0:i_in1]))
+        start_in, k_in = i_in0, i_in0
+    if k_out < b and k_out > k_in:
+        outer_lvl = float(np.median(s[max(k_out - 2, k_in):k_out + 1]))
+        start_out = k_out
+    else:
+        outer_lvl = float(np.median(s[i_out0:i_out1]))
+        start_out, k_out = i_out1 - 1, i_out1 - 1
+    r1 = _edge_cross(s, start_in, 0.5 * (floor + inner_lvl), -1)
+    r2 = _edge_cross(s, start_out, 0.5 * (floor + outer_lvl), +1)
+    touches = (not math.isfinite(r2)) or b >= lim - 1 or r2 >= lim - 1.0
+    if cov_prof is not None and len(cov_prof) == len(s):
+        # The variance is c (1 - c) delta^2: its half level sits below half
+        # coverage once the coverage c is not small.  The coverage is largest
+        # at the inner edge (c ~ 1/r), so re-cross the *inner* edge on the
+        # coverage-linear profile, accepting the crossing only when it stays
+        # within the edge ramp of the variance crossing.  (The outer edge has
+        # small coverage and sits next to the backplate rim, whose own edge
+        # lifts the coverage-linear profile, so it keeps the variance edge.)
+        q = gaussian_filter1d(np.asarray(cov_prof, dtype=np.float64), 1.5)
+        q_floor = float(np.percentile(q[3:lim], 5))
+        if len(outside) >= 4:
+            q_floor = min(q_floor, float(np.median(q[lim + 3:])))
+        q_in = float(np.median(q[k_in:min(k_in + 3, k_out + 1)]))
+        r1q, r1_var = float("nan"), r1
+        if q_in - q_floor > 2.0:
+            r1q = _edge_cross(q, start_in, 0.5 * (q_floor + q_in), -1)
+            tol_in = max(1.5, min(0.3 * (k_in - a), 6.0))
+            if math.isfinite(r1q) and math.isfinite(r1) and abs(r1q - r1) <= tol_in:
+                r1 = r1q
+        debug["band_cov"] = {"floor": q_floor, "inner_level": q_in, "r1_px": r1q,
+                             "r1_var_px": r1_var}
+    if not math.isfinite(r1):
+        r1 = float(a)
+    if not math.isfinite(r2):
+        r2 = float(min(b + 1, lim))
     contrast = math.sqrt(max(0.5 * (inner_lvl + outer_lvl) - floor, 0.0)) / math.sqrt(max(floor, 1.0))
     debug["band"] = {"floor_var": floor, "peak_var": peak, "threshold_var": thr,
-                     "coarse": (int(a), int(b)),
+                     "coarse": (int(a), int(b)), "limit": int(lim),
                      "r1_px": r1, "r2_px": r2, "inner_level": inner_lvl,
-                     "outer_level": outer_lvl}
+                     "outer_level": outer_lvl, "touches_limit": bool(touches)}
     return r1, r2, float(contrast)
 
 
@@ -263,42 +394,114 @@ def _hub_radius(mean_prof: np.ndarray, r1: float, debug: dict[str, Any]
     if abs(step) < 12:
         return None, 0.0
     r_hub = _edge_cross(m, max(lo, k - 2 * half), 0.5 * (lvl_in + lvl_out), +1)
+    if not math.isfinite(r_hub) or r_hub >= r1:
+        return None, 0.0
     debug["hub"]["r_hub_px"] = r_hub
     conf = float(np.clip(abs(step) / 60.0, 0.0, 1.0))
     return r_hub, conf
 
 
+def _comb_score(mag: np.ndarray, kmax: int) -> np.ndarray:
+    """Harmonic-comb score of a magnitude spectrum for every candidate Z.
+
+    A blade is a narrow dark pulse, so its spectrum is a long flat comb at
+    multiples of Z.  Summing only the first three harmonics (as a naive score
+    does) cannot tell Z from 2Z or 3Z for such a comb.  Instead every bin of
+    the comb up to ``3 * kmax`` is summed after subtracting the noise floor
+    (median magnitude), normalised by sqrt(number of terms): the true Z
+    collects the whole comb, 2Z / 3Z only every 2nd / 3rd tooth, and
+    sub-multiples pay for the empty bins between the teeth.
+    """
+    floor = float(np.median(mag[1:])) if len(mag) > 2 else 0.0
+    top = min(len(mag) - 1, 3 * kmax)
+    score = np.zeros(kmax + 1)
+    for k in range(Z_MIN, kmax + 1):
+        idx = np.arange(k, top + 1, k)
+        if len(idx) == 0:
+            continue
+        score[k] = float(np.maximum(mag[idx] - floor, 0.0).sum()) / math.sqrt(len(idx))
+    return score
+
+
+def _direct_minima_count(pol: np.ndarray, cols: np.ndarray) -> dict[int, int]:
+    """Count the strong angular minima per radius column -> {count: n_columns}.
+
+    Independent of the spectrum: smooth each row lightly, find all local
+    minima and keep those at least 40 % as prominent as the deepest one.
+    """
+    H = pol.shape[0]
+    sigma = max(1.0, H / 1440.0)
+    dist = max(2, int(0.5 * H / Z_MAX))
+    counts: dict[int, int] = {}
+    for c in cols:
+        row = gaussian_filter1d(pol[:, c].astype(np.float64), sigma, mode="wrap")
+        pad = H // 8
+        ext = np.concatenate([row[-pad:], row, row[:pad]])
+        peaks, props = find_peaks(-ext, distance=dist, prominence=4.0)
+        pos = peaks - pad
+        ok = (pos >= 0) & (pos < H)
+        prom = props["prominences"][ok]
+        if len(prom) == 0:
+            continue
+        n = int(np.sum(prom >= 0.4 * prom.max()))
+        counts[n] = counts.get(n, 0) + 1
+    return counts
+
+
 def _blade_count(pol: np.ndarray, c_lo: int, c_hi: int, hint: int | None,
                  debug: dict[str, Any]) -> tuple[int, float]:
-    """Majority vote of the harmonic-sum spectrum over radii -> (Z, agreement)."""
+    """Blade count -> (Z, agreement in 0..1).
+
+    Majority vote of the harmonic-comb spectrum score over radii, cross-checked
+    against a direct count of the angular minima.  When the two disagree by a
+    harmonic factor (Z vs 2Z, 3Z, Z/2 ...) the direct count resolves the
+    harmonic ambiguity that is the spectrum's one weak spot; ``hint`` only
+    breaks ties / disagreements, as SPEC requires.
+    """
     H = pol.shape[0]
     cols = np.unique(np.linspace(c_lo, c_hi, 24).round().astype(int))
     votes: dict[int, int] = {}
     kmax = min(Z_MAX, H // 2 - 1)
+    score_sum = np.zeros(kmax + 1)
     for c in cols:
         row = pol[:, c].astype(np.float64)
         row -= row.mean()
         mag = np.abs(np.fft.rfft(row))
-        score = np.zeros(kmax + 1)
-        for k in range(Z_MIN, kmax + 1):
-            # sum of the first harmonics: the fundamental beats its multiples,
-            # and sub-multiples only collect noise bins
-            tot, n = 0.0, 0
-            for mlt in (1, 2, 3):
-                if mlt * k < len(mag):
-                    tot += mag[mlt * k]
-                    n += 1
-            score[k] = tot / max(n, 1) + 0.5 * mag[k]
+        score = _comb_score(mag, kmax)
+        if score.max() > 0:
+            score_sum += score / score.max()
         k = int(np.argmax(score))
         votes[k] = votes.get(k, 0) + 1
     debug["blade_count_votes"] = votes
     best = max(votes.values())
     tied = sorted(k for k, v in votes.items() if v == best)
-    if hint is not None and hint in tied:
-        Z = hint
-    else:
-        Z = tied[0]
-    return Z, best / float(len(cols))
+    z_fft = hint if (hint is not None and hint in tied) else tied[0]
+
+    # direct cross-check on a subset of the radii
+    sub = np.unique(np.linspace(c_lo, c_hi, 9).round().astype(int))
+    counts = _direct_minima_count(pol, sub)
+    debug["blade_count_direct"] = counts
+    z_direct = max(counts, key=lambda k: (counts[k], -k)) if counts else None
+    if z_direct is not None and not (Z_MIN <= z_direct <= kmax):
+        z_direct = None
+
+    Z = z_fft
+    agreement = best / float(len(cols))
+    if z_direct is not None and z_direct != z_fft:
+        harmonic = z_fft % z_direct == 0 or z_direct % z_fft == 0
+        direct_frac = counts[z_direct] / float(sum(counts.values()))
+        supported = score_sum[z_direct] >= 0.5 * score_sum[z_fft]
+        if hint is not None and hint in (z_fft, z_direct):
+            Z = hint
+        elif harmonic and supported and direct_frac >= 0.5:
+            Z = z_direct
+        if Z != z_fft:
+            agreement = min(agreement, direct_frac) * 0.9
+        else:
+            agreement *= 0.8
+    debug["blade_count_fft"] = int(z_fft)
+    debug["blade_count_direct_mode"] = z_direct
+    return int(Z), float(np.clip(agreement, 0.0, 1.0))
 
 
 def _ridge_center_width(row: np.ndarray, m: int, H: int, base: float | None = None,
@@ -403,14 +606,12 @@ def _trace_blades(pol: np.ndarray, Z: int, c_lo: int, c_hi: int, dphi: float,
     minima = {int(c): _row_minima(sm[:, c], Z, H) for c in cols}
 
     # seed at the column nearest to mid radius that yields exactly Z minima
-    mid = (c_lo + c_hi) // 2
+    # (every column in [c_lo, c_hi] is visited, nearest to mid first)
+    mid = 0.5 * (c_lo + c_hi)
     seed = None
-    for d in range(0, (c_hi - c_lo) // 2 + 1):
-        for c in (mid - d, mid + d):
-            if c_lo <= c <= c_hi and len(minima[c][0]) == Z:
-                seed = c
-                break
-        if seed is not None:
+    for c in sorted((int(c) for c in cols), key=lambda c: (abs(c - mid), c)):
+        if len(minima[c][0]) == Z:
+            seed = c
             break
     if seed is None:
         raise ValueError(f"could not find {Z} blade minima at any radius")
@@ -490,13 +691,55 @@ def analyze(img: np.ndarray, *, ref_diameter_mm: float | None = None,
     cx, cy, disc_r = _find_disc(gray, ref, debug)
 
     # 3. polar unwrap, radial profiles ------------------------------------
-    pol, r_px, dphi = _polar(gray, cx, cy, disc_r * 1.06)
+    h_img, w_img = gray.shape
+    border_r = float(max(min(cx, cy, w_img - 1 - cx, h_img - 1 - cy), 1.0))
+    max_r = disc_r * 1.06
+    pol, r_px, dphi = _polar(gray, cx, cy, max_r)
     mean_prof = pol.mean(axis=0)
     std_prof = pol.std(axis=0)
-    r1_px, r2_px, contrast = _blade_band(std_prof, disc_r, debug)
+    # coverage-linear profile: light level (75th percentile) minus the mean
+    cov_prof = np.percentile(pol, 75, axis=0) - mean_prof
+    r1_px, r2_px, contrast = _blade_band(std_prof, disc_r, debug, cov_prof)
+    band_truncated = False
+    if debug["band"]["touches_limit"]:
+        # The blade band runs into the end of the unwrapped range (the disc
+        # was under-detected, or the blades reach past the backplate rim):
+        # unwrap again with a wider radius, bounded by the image border, and
+        # let the band finder use all of it.
+        max_r = float(min(max(disc_r * 1.3, disc_r + 24.0), border_r))
+        pol, r_px, dphi = _polar(gray, cx, cy, max_r)
+        mean_prof = pol.mean(axis=0)
+        std_prof = pol.std(axis=0)
+        cov_prof = np.percentile(pol, 75, axis=0) - mean_prof
+        first_band = debug["band"]
+        r1_px, r2_px, contrast = _blade_band(std_prof, float(pol.shape[1] - 1), debug, cov_prof)
+        debug["band_first_pass"] = first_band
+        debug["band"]["reunwrapped_max_r"] = max_r
+        band_truncated = bool(debug["band"]["touches_limit"])
+        if band_truncated:
+            warnings.append("blade band reaches the edge of the unwrapped radius range; "
+                            "outer diameter is a lower bound")
+    if r2_px > disc_r + 2.0:
+        warnings.append("blade tips lie outside the detected backplate disc "
+                        f"(r2 {r2_px:.1f} px vs disc {disc_r:.1f} px)")
+    elif r2_px < 0.6 * disc_r:
+        warnings.append("blade band ends well inside the backplate disc "
+                        f"(r2 {r2_px:.0f} px vs disc {disc_r:.0f} px)")
     r_hub_px, hub_conf = _hub_radius(mean_prof, r1_px, debug)
+    # Blade overlap check: a row whose median is darker than its mean is more
+    # than half blade.  Blades that overlap near the eye make the inner edge
+    # ill-defined for any angular statistic, so flag it rather than guess.
+    w_chk = max(r2_px - r1_px, 1.0)
+    chk_cols = range(int(r1_px) + 1, min(int(r1_px + 0.3 * w_chk) + 1, pol.shape[1]))
+    dark_major = int(sum(float(np.median(pol[:, c])) < float(mean_prof[c]) - 4.0 for c in chk_cols))
+    blades_overlap = dark_major >= 3
+    if blades_overlap:
+        warnings.append("blades cover more than half the circumference near the eye "
+                        f"({dark_major} radii with a dark majority): overlapping blades, "
+                        "inner diameter is unreliable")
     debug.update({"polar": pol, "r_px": r_px, "dphi": dphi, "mean_profile": mean_prof,
-                  "std_profile": std_prof})
+                  "std_profile": std_prof, "max_r_px": max_r,
+                  "dark_majority_cols": dark_major})
 
     if px_per_mm is None:
         px_per_mm = 2.0 * r2_px / float(outer_diameter_mm)   # type: ignore[arg-type]
@@ -610,9 +853,10 @@ def analyze(img: np.ndarray, *, ref_diameter_mm: float | None = None,
             warnings.append("hub estimate implausible; estimated as 0.33 * D1")
             hub_conf = 0.1
 
+    d_conf = float(np.clip(0.5 + 0.1 * contrast, 0.3, 0.95))
     conf.update({
-        "outer_diameter": float(np.clip(0.5 + 0.1 * contrast, 0.3, 0.95)),
-        "inner_diameter": float(np.clip(0.5 + 0.1 * contrast, 0.3, 0.95)),
+        "outer_diameter": min(d_conf, 0.4) if band_truncated else d_conf,
+        "inner_diameter": min(d_conf, 0.3) if blades_overlap else d_conf,
         "hub_diameter": hub_conf,
         "blade_count": float(agreement),
         "blade_angle_inlet": beta_conf,
