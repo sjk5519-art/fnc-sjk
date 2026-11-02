@@ -29,8 +29,14 @@ class ImpellerParams:
     # Secondary / structural
     backplate_thickness: float = 3.0
     hub_height: float | None = None  # defaults to blade_width + backplate
-    shroud: bool = False             # add a front shroud ring (r1..r2)
+    shroud: bool = False             # add a front shroud (ring, or cone+eye ring if eye_diameter set)
     shroud_thickness: float = 2.0
+    # ---- shrouded (production-type) impeller geometry, all optional -------
+    eye_diameter: float | None = None        # shroud inlet ring inner diameter (defaults to D1)
+    shroud_cone_height: float = 0.0          # axial rise of the shroud from the rim (z=b2) to the eye
+    shroud_inlet_height: float = 0.0         # height of the cylindrical inlet ring above the cone top
+    hub_bore_diameter: float = 0.0           # through-bore in the hub/backplate (0 = solid hub)
+    blade_width_inlet: float | None = None   # b1 at the leading edge (defaults to blade_width = b2)
     # Free-form metadata (source image, confidence, notes...)
     meta: dict[str, Any] = field(default_factory=dict)
 
@@ -46,6 +52,22 @@ class ImpellerParams:
     @property
     def r_hub(self) -> float:
         return self.hub_diameter / 2.0
+
+    @property
+    def r_eye(self) -> float:
+        return (self.eye_diameter if self.eye_diameter else self.inner_diameter) / 2.0
+
+    @property
+    def b1(self) -> float:
+        return self.blade_width_inlet if self.blade_width_inlet else self.blade_width
+
+    @property
+    def b2(self) -> float:
+        return self.blade_width
+
+    @property
+    def is_shrouded(self) -> bool:
+        return bool(self.shroud)
 
     @property
     def diameter_ratio(self) -> float:
@@ -77,6 +99,14 @@ class ImpellerParams:
             raise ValueError("blade_width and blade_thickness must be positive")
         if self.blade_thickness * 4 > (self.r2 - self.r1):
             raise ValueError("blade_thickness is implausibly large for the blade span")
+        if self.eye_diameter is not None and not (self.hub_diameter < self.eye_diameter <= self.outer_diameter):
+            raise ValueError("eye_diameter must lie between hub_diameter and outer_diameter")
+        if self.hub_bore_diameter < 0 or self.hub_bore_diameter >= self.hub_diameter:
+            raise ValueError("hub_bore_diameter must be >= 0 and < hub_diameter")
+        if self.blade_width_inlet is not None and self.blade_width_inlet <= 0:
+            raise ValueError("blade_width_inlet must be positive")
+        if self.shroud_cone_height < 0 or self.shroud_inlet_height < 0:
+            raise ValueError("shroud heights must be >= 0")
 
     # ---- serialisation ---------------------------------------------------
     def to_dict(self) -> dict[str, Any]:
@@ -118,6 +148,27 @@ class ImpellerParams:
                               "abs_err": other.blade_count - self.blade_count}
         return out
 
+
+# A plausible production-type shrouded impeller (modelled on the user's sample:
+# cream ABS, conical front shroud with an inlet ring, bolted hub flange with a bore).
+SHROUDED_PARAMS_FACTORY = lambda: ImpellerParams(  # noqa: E731
+    outer_diameter=300.0,
+    inner_diameter=190.0,
+    hub_diameter=90.0,
+    blade_count=11,
+    blade_angle_inlet=30.0,
+    blade_angle_outlet=40.0,
+    blade_width=55.0,
+    blade_width_inlet=75.0,
+    blade_thickness=3.0,
+    backplate_thickness=4.0,
+    shroud=True,
+    shroud_thickness=3.0,
+    eye_diameter=180.0,
+    shroud_cone_height=20.0,
+    shroud_inlet_height=18.0,
+    hub_bore_diameter=60.0,
+)
 
 # A plausible default: 200 mm backward-curved impeller.
 DEFAULT_PARAMS = ImpellerParams(

@@ -104,3 +104,44 @@ def fit_linear_beta(r: np.ndarray, theta: np.ndarray, r1: float, r2: float
 def total_sweep_deg(r1: float, r2: float, beta1_deg: float, beta2_deg: float) -> float:
     _, th = camber_line(r1, r2, beta1_deg, beta2_deg, n=256)
     return math.degrees(th[-1])
+
+
+# ---------------------------------------------------------------------------
+# Wrap-angle relations (used by the shrouded-mode beta2 solver)
+# ---------------------------------------------------------------------------
+
+def wrap_from_betas(r1: float, r2: float, beta1_deg: float, beta2_deg: float) -> float:
+    """Total blade wrap angle [deg] from r1 to r2 under the linear-beta model."""
+    return total_sweep_deg(r1, r2, beta1_deg, beta2_deg)
+
+
+def beta2_from_wrap(r1: float, r2: float, beta1_deg: float, wrap_deg: float,
+                    lo: float = 5.0, hi: float = 170.0) -> float:
+    """Solve wrap_from_betas(r1, r2, beta1, beta2) == wrap_deg for beta2 [deg].
+
+    The wrap angle is monotonically decreasing in beta2 on (0, 90) and the
+    model is only meaningful for 0 < beta < 180, so a bracketed root find is
+    safe.  Raises ValueError if wrap_deg is outside the attainable range.
+    """
+    from scipy.optimize import brentq
+
+    f = lambda b2: wrap_from_betas(r1, r2, beta1_deg, b2) - wrap_deg  # noqa: E731
+    f_lo, f_hi = f(lo), f(hi)
+    if f_lo * f_hi > 0:
+        raise ValueError(
+            f"wrap {wrap_deg:.1f} deg not attainable with beta1={beta1_deg} "
+            f"(range {f(hi)+wrap_deg:.1f}..{f(lo)+wrap_deg:.1f} deg)")
+    return float(brentq(f, lo, hi, xtol=1e-6))
+
+
+def wrap_mod_pitch_candidates(wrap_mod_deg: float, blade_count: int,
+                              est_wrap_deg: float, k_max: int = 6) -> list[float]:
+    """Resolve a wrap angle known only modulo the blade pitch.
+
+    Returns candidate wrap angles wrap_mod + k*pitch (k >= 0) sorted by
+    closeness to *est_wrap_deg* (e.g. the extrapolated estimate).
+    """
+    pitch = 360.0 / blade_count
+    base = wrap_mod_deg % pitch
+    cands = [base + k * pitch for k in range(k_max + 1)]
+    return sorted(cands, key=lambda w: abs(w - est_wrap_deg))
